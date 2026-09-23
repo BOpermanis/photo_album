@@ -238,6 +238,28 @@ input[type="text"] {
 }
 .facebox.named { border-color: var(--accent-2); }
 .facebox.active { border-color: #fff; border-width: 3px; }
+.facebox.draft {
+  border-style: dashed;
+  border-color: #fff;
+  background: rgba(79, 140, 255, 0.15);
+  cursor: crosshair;
+}
+.stage.drawing { cursor: crosshair; }
+.stage.drawing .facebox:not(.draft) { pointer-events: none; }
+
+.stage-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.draw-toggle.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.draw-hint { font-size: 0.85rem; }
+
 .facebox .num {
   position: absolute;
   top: -12px;

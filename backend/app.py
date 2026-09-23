@@ -235,6 +235,33 @@ def delete_face(face_id: int, session: Session = Depends(get_session)):
     return {"status": "deleted", "id": face_id}
 
 
+class ManualFaceBody(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+@app.post("/api/photos/{photo_id}/faces")
+def add_manual_face(
+    photo_id: int, body: ManualFaceBody, session: Session = Depends(get_session)
+):
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    x = max(0.0, min(body.x, float(photo.width)))
+    y = max(0.0, min(body.y, float(photo.height)))
+    w = min(body.w, float(photo.width) - x)
+    h = min(body.h, float(photo.height) - y)
+    if w < 1.0 or h < 1.0:
+        raise HTTPException(status_code=400, detail="Box is too small")
+    face = Face(photo_id=photo_id, x=x, y=y, w=w, h=h, confidence=1.0)
+    session.add(face)
+    session.commit()
+    session.refresh(face)
+    return _face_dict(session, face)
+
+
 # ------------------------------- people -----------------------------------
 class PersonBody(BaseModel):
     name: str

@@ -171,6 +171,7 @@ async function viewPhotoDetail(id) {
       <div class="detail">
         <div class="stage-col">
           <div class="stage" id="stage"></div>
+          <div class="stage-tools" id="stageTools"></div>
           <div id="descWrap"></div>
         </div>
         <div class="side" id="side"></div>
@@ -182,7 +183,7 @@ async function viewPhotoDetail(id) {
   const stage = view.querySelector("#stage");
   const side = view.querySelector("#side");
   const descWrap = view.querySelector("#descWrap");
-
+  const stageTools = view.querySelector("#stageTools");
   let photo, persons;
   try {
     [photo, persons] = await Promise.all([
@@ -335,6 +336,86 @@ async function viewPhotoDetail(id) {
       datalist.appendChild(el(`<option value="${esc(p.name)}"></option>`));
     render();
   }
+
+  // --- Manual face box drawing ---
+  const drawBtn = el(`<button class="secondary draw-toggle">+ Add face box</button>`);
+  const drawHint = el(`<span class="muted draw-hint" hidden>Drag on the photo to mark a face.</span>`);
+  stageTools.appendChild(drawBtn);
+  stageTools.appendChild(drawHint);
+
+  let drawMode = false;
+  function setDrawMode(on) {
+    drawMode = on;
+    stage.classList.toggle("drawing", on);
+    drawBtn.classList.toggle("active", on);
+    drawBtn.textContent = on ? "Cancel" : "+ Add face box";
+    drawHint.hidden = !on;
+  }
+  drawBtn.addEventListener("click", () => setDrawMode(!drawMode));
+
+  let draft = null;
+  let startX = 0;
+  let startY = 0;
+
+  function frac(e) {
+    const rect = stage.getBoundingClientRect();
+    const fx = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const fy = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    return [fx, fy];
+  }
+
+  stage.addEventListener("pointerdown", (e) => {
+    if (!drawMode) return;
+    e.preventDefault();
+    [startX, startY] = frac(e);
+    draft = el(
+      `<div class="facebox draft" style="left:${startX * 100}%;top:${startY * 100}%;width:0;height:0"></div>`
+    );
+    stage.appendChild(draft);
+    stage.setPointerCapture(e.pointerId);
+  });
+
+  stage.addEventListener("pointermove", (e) => {
+    if (!draft) return;
+    const [fx, fy] = frac(e);
+    draft.style.left = Math.min(fx, startX) * 100 + "%";
+    draft.style.top = Math.min(fy, startY) * 100 + "%";
+    draft.style.width = Math.abs(fx - startX) * 100 + "%";
+    draft.style.height = Math.abs(fy - startY) * 100 + "%";
+  });
+
+  async function finishDraft(e) {
+    if (!draft) return;
+    const [fx, fy] = frac(e);
+    const left = Math.min(fx, startX);
+    const top = Math.min(fy, startY);
+    const w = Math.abs(fx - startX);
+    const h = Math.abs(fy - startY);
+    draft.remove();
+    draft = null;
+    setDrawMode(false);
+    if (w < 0.01 || h < 0.01) return; // ignore accidental clicks
+    try {
+      await postJSON(`/api/photos/${id}/faces`, {
+        x: left * W,
+        y: top * H,
+        w: w * W,
+        h: h * H,
+      });
+      await reload();
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+
+  stage.addEventListener("pointerup", finishDraft);
+  stage.addEventListener("pointercancel", () => {
+    if (draft) {
+      draft.remove();
+      draft = null;
+    }
+    setDrawMode(false);
+  });
 
   if (img.complete) render();
   else img.addEventListener("load", render);
