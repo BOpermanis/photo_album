@@ -35,3 +35,10 @@ class Face(SQLModel, table=True):
     h: float
     confidence: float = 0.0
     person_id: Optional[int] = Field(default=None, foreign_key="person.id", index=True)
+
+
+class FaceIndexEntry(SQLModel, table=True):
+    # Maps an Annoy item slot to the reference face/person it was built from.
+    item: int = Field(primary_key=True)
+    face_id: int = Field(foreign_key="face.id", index=True)
+    person_id: int = Field(foreign_key="person.id", index=True)

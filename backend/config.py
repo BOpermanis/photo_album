@@ -17,6 +17,5 @@ ANNOY_N_TREES = 10
 # Cosine similarity threshold for surfacing a name suggestion (user confirms).
 RECOGNITION_THRESHOLD = 0.35
 ANNOY_PATH = DATA_DIR / "face_index.ann"
-ANNOY_META_PATH = DATA_DIR / "face_index.json"
 
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)

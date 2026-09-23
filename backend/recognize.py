@@ -2,8 +2,9 @@
 
 The index holds only faces a user has manually named. Embeddings for any
 detected face live in a transient in-memory cache; reference embeddings are
-persisted inside the Annoy `.ann` file (with a JSON sidecar mapping each item
-to its face/person) so suggestions survive a restart.
+persisted inside the Annoy `.ann` file. The mapping from each Annoy slot back
+to its face/person lives in the `faceindexentry` SQLite table, so suggestions
+survive a restart.
 """
 
 import json
@@ -11,14 +12,16 @@ import threading
 
 import numpy as np
 from annoy import AnnoyIndex
+from sqlmodel import Session, delete, select
 
 from .config import (
-    ANNOY_META_PATH,
     ANNOY_N_TREES,
     ANNOY_PATH,
     EMBED_DIM,
     RECOGNITION_THRESHOLD,
 )
+from .db import engine
+from .models import FaceIndexEntry
 
 _lock = threading.RLock()
 _ann: AnnoyIndex | None = None
@@ -45,47 +48,77 @@ def cache_has(face_id: int) -> bool:
 
 # ------------------------------ index lifecycle ---------------------------
 def load() -> None:
-    """Load the persisted Annoy index + metadata into memory at startup."""
+    """Load the persisted Annoy index + mapping table into memory at startup."""
     global _ann, _order, _ref
     with _lock:
         _ann, _order, _ref = None, [], {}
-        if not (ANNOY_PATH.exists() and ANNOY_META_PATH.exists()):
+        if not ANNOY_PATH.exists():
             return
         try:
-            items = json.loads(ANNOY_META_PATH.read_text()).get("items", [])
+            with Session(engine) as session:
+                rows = session.exec(
+                    select(FaceIndexEntry).order_by(FaceIndexEntry.item)
+                ).all()
+            if not rows and _migrate_legacy_json_locked():
+                return
+            if not rows:
+                return
             ann = AnnoyIndex(EMBED_DIM, "angular")
             ann.load(str(ANNOY_PATH))
-            for i, it in enumerate(items):
-                fid, pid = int(it["face_id"]), int(it["person_id"])
-                _ref[fid] = (pid, np.asarray(ann.get_item_vector(i), dtype=np.float32))
-                _order.append(fid)
+            for row in rows:
+                vec = np.asarray(ann.get_item_vector(row.item), dtype=np.float32)
+                _ref[row.face_id] = (row.person_id, vec)
+                _order.append(row.face_id)
             _ann = ann
         except Exception as exc:  # pragma: no cover - corrupt/incompatible file
             print(f"[recognize] failed to load index: {exc}")
             _ann, _order, _ref = None, [], {}
 
 
+def _migrate_legacy_json_locked() -> bool:
+    """One-time import of the old JSON sidecar into the mapping table."""
+    legacy = ANNOY_PATH.with_suffix(".json")
+    if not legacy.exists():
+        return False
+    try:
+        items = json.loads(legacy.read_text()).get("items", [])
+        ann = AnnoyIndex(EMBED_DIM, "angular")
+        ann.load(str(ANNOY_PATH))
+        for i, it in enumerate(items):
+            fid, pid = int(it["face_id"]), int(it["person_id"])
+            _ref[fid] = (pid, np.asarray(ann.get_item_vector(i), dtype=np.float32))
+        _rebuild_locked()
+        legacy.unlink(missing_ok=True)
+        print(f"[recognize] migrated {len(items)} entries from JSON to SQLite")
+        return True
+    except Exception as exc:  # pragma: no cover - best-effort migration
+        print(f"[recognize] legacy migration failed: {exc}")
+        _ref.clear()
+        return False
+
+
 def _rebuild_locked() -> None:
     global _ann, _order
-    if not _ref:
-        _ann, _order = None, []
-        for p in (ANNOY_PATH, ANNOY_META_PATH):
+    with Session(engine) as session:
+        session.exec(delete(FaceIndexEntry))
+        if not _ref:
+            session.commit()
+            _ann, _order = None, []
             try:
-                p.unlink(missing_ok=True)
+                ANNOY_PATH.unlink(missing_ok=True)
             except Exception:
                 pass
-        return
-    ann = AnnoyIndex(EMBED_DIM, "angular")
-    order: list[int] = []
-    items: list[dict] = []
-    for i, (fid, (pid, vec)) in enumerate(_ref.items()):
-        ann.add_item(i, vec.tolist())
-        order.append(fid)
-        items.append({"face_id": fid, "person_id": pid})
-    ann.build(ANNOY_N_TREES)
-    ann.save(str(ANNOY_PATH))
-    ANNOY_META_PATH.write_text(json.dumps({"items": items}))
-    _ann, _order = ann, order
+            return
+        ann = AnnoyIndex(EMBED_DIM, "angular")
+        order: list[int] = []
+        for i, (fid, (pid, vec)) in enumerate(_ref.items()):
+            ann.add_item(i, vec.tolist())
+            order.append(fid)
+            session.add(FaceIndexEntry(item=i, face_id=fid, person_id=pid))
+        ann.build(ANNOY_N_TREES)
+        ann.save(str(ANNOY_PATH))
+        session.commit()
+        _ann, _order = ann, order
 
 
 def add(face_id: int, person_id: int, emb) -> None:

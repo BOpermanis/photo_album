@@ -357,6 +357,9 @@ input[type="text"] {
 }
 .face-item.named .num-pill { background: var(--accent-2); }
 
+.face-item .save { background: var(--muted); }
+.face-item.named .save { background: var(--accent-2); }
+
 .face-item .suggestion {
   margin-top: 8px;
   padding: 6px 8px;
