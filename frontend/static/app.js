@@ -339,6 +339,31 @@ async function viewPhotoDetail(id) {
   if (img.complete) render();
   else img.addEventListener("load", render);
 
+  // Keep the face list the same height as the image so it scrolls beside it.
+  const isNarrow = () => window.matchMedia("(max-width: 760px)").matches;
+  function syncSideHeight() {
+    if (isNarrow()) {
+      side.style.maxHeight = "";
+      side.style.overflowY = "";
+      return;
+    }
+    const h = stage.getBoundingClientRect().height;
+    if (h > 0) {
+      side.style.maxHeight = h + "px";
+      side.style.overflowY = "auto";
+    }
+  }
+  if (img.complete) syncSideHeight();
+  else img.addEventListener("load", syncSideHeight);
+  const onResize = () => {
+    if (!document.body.contains(view)) {
+      window.removeEventListener("resize", onResize);
+      return;
+    }
+    syncSideHeight();
+  };
+  window.addEventListener("resize", onResize);
+
   // Poll while detection is pending.
   if (!photo.processed) {
     const timer = setInterval(async () => {
