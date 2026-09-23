@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
 from . import detect
+from . import recognize
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT
 from .db import get_session, init_db
 from .models import Face, Person, Photo
@@ -79,6 +80,7 @@ def _print_qr() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    recognize.load()
     detect.start_worker()
     _print_qr()
     yield
@@ -120,7 +122,38 @@ def _photo_summary(session: Session, photo: Photo) -> dict:
     }
 
 
-# ------------------------------- media ------------------------------------
+def _attach_suggestions(
+    session: Session, photo: Photo, faces: list, face_dicts: list
+) -> None:
+    """Add suggested_person_* fields to unnamed faces that match a known person."""
+    unnamed = [f for f in faces if f.person_id is None]
+    if not unnamed:
+        return
+    missing = [f for f in unnamed if not recognize.cache_has(f.id)]
+    if missing:
+        try:
+            embs = detect.get_detector().embed_photo(
+                LIBRARY_DIR / photo.filename, missing
+            )
+            for fid, emb in embs.items():
+                recognize.cache_set(fid, emb)
+        except Exception as exc:  # pragma: no cover - detection is best-effort
+            print(f"[recognize] embed failed for {photo.filename}: {exc}")
+    by_id = {f.id: d for f, d in zip(faces, face_dicts)}
+    for f in unnamed:
+        emb = recognize.cache_get(f.id)
+        if emb is None:
+            continue
+        match = recognize.query(emb)
+        if not match:
+            continue
+        person = session.get(Person, match["person_id"])
+        if not person:
+            continue
+        d = by_id[f.id]
+        d["suggested_person_id"] = match["person_id"]
+        d["suggested_person_name"] = person.name
+        d["suggested_score"] = match["score"]
 @app.get("/media/{filename}")
 def media(filename: str):
     library = LIBRARY_DIR.resolve()
@@ -148,6 +181,8 @@ def get_photo(photo_id: int, session: Session = Depends(get_session)):
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
     faces = session.exec(select(Face).where(Face.photo_id == photo_id)).all()
+    face_dicts = [_face_dict(session, f) for f in faces]
+    _attach_suggestions(session, photo, faces, face_dicts)
     return {
         "id": photo.id,
         "filename": photo.filename,
@@ -155,7 +190,7 @@ def get_photo(photo_id: int, session: Session = Depends(get_session)):
         "height": photo.height,
         "processed": photo.processed,
         "description": photo.description,
-        "faces": [_face_dict(session, f) for f in faces],
+        "faces": face_dicts,
     }
 
 
@@ -211,7 +246,27 @@ def assign_face(
     face.person_id = person.id
     session.add(face)
     session.commit()
+    _index_reference_face(session, face, person.id)
     return _face_dict(session, face)
+
+
+def _index_reference_face(session: Session, face: Face, person_id: int) -> None:
+    """Add a confirmed face's embedding to the in-memory recognition index."""
+    emb = recognize.cache_get(face.id)
+    if emb is None:
+        photo = session.get(Photo, face.photo_id)
+        if photo:
+            try:
+                embs = detect.get_detector().embed_photo(
+                    LIBRARY_DIR / photo.filename, [face]
+                )
+                emb = embs.get(face.id)
+                if emb is not None:
+                    recognize.cache_set(face.id, emb)
+            except Exception as exc:  # pragma: no cover - detection is best-effort
+                print(f"[recognize] embed failed for face {face.id}: {exc}")
+    if emb is not None:
+        recognize.add(face.id, person_id, emb)
 
 
 @app.post("/api/faces/{face_id}/unassign")
@@ -222,6 +277,7 @@ def unassign_face(face_id: int, session: Session = Depends(get_session)):
     face.person_id = None
     session.add(face)
     session.commit()
+    recognize.remove(face_id)
     return _face_dict(session, face)
 
 
@@ -232,6 +288,7 @@ def delete_face(face_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Face not found")
     session.delete(face)
     session.commit()
+    recognize.remove(face_id)
     return {"status": "deleted", "id": face_id}
 
 

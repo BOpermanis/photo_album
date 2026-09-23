@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from .config import LIBRARY_DIR
 from .db import engine
 from .models import Face, Photo
+from . import recognize
 
 try:
     import pillow_heif
@@ -21,7 +22,7 @@ class FaceDetector:
         from insightface.app import FaceAnalysis
 
         self.app = FaceAnalysis(
-            allowed_modules=["detection"],
+            allowed_modules=["detection", "recognition"],
             providers=["CPUExecutionProvider"],
         )
         self.app.prepare(ctx_id=0, det_size=(640, 640))
@@ -34,6 +35,7 @@ class FaceDetector:
 
         faces = self.app.get(arr)
         results = []
+        embeddings = []
         for f in faces:
             x1, y1, x2, y2 = (float(v) for v in f.bbox)
             results.append(
@@ -45,11 +47,51 @@ class FaceDetector:
                     "confidence": float(getattr(f, "det_score", 0.0)),
                 }
             )
-        return width, height, results
+            emb = getattr(f, "normed_embedding", None)
+            embeddings.append(
+                np.asarray(emb, dtype=np.float32) if emb is not None else None
+            )
+        return width, height, results, embeddings
+
+    def embed_photo(self, path, faces):
+        """Compute embeddings for stored Face rows by IoU-matching detections."""
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            arr = np.asarray(im)[:, :, ::-1]
+        detected = self.app.get(arr)
+        out = {}
+        for face in faces:
+            best_emb = None
+            best_iou = 0.0
+            for d in detected:
+                emb = getattr(d, "normed_embedding", None)
+                if emb is None:
+                    continue
+                x1, y1, x2, y2 = (float(v) for v in d.bbox)
+                iou = _iou(
+                    (face.x, face.y, face.w, face.h),
+                    (x1, y1, x2 - x1, y2 - y1),
+                )
+                if iou > best_iou:
+                    best_iou, best_emb = iou, emb
+            if best_emb is not None and best_iou >= 0.3:
+                out[face.id] = np.asarray(best_emb, dtype=np.float32)
+        return out
 
 
 _detector = None
 _detector_lock = threading.Lock()
+
+
+def _iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
 
 
 def get_detector() -> FaceDetector:
@@ -69,16 +111,22 @@ def process_pending() -> None:
         for photo in pending:
             path = LIBRARY_DIR / photo.filename
             try:
-                width, height, faces = detector.detect(path)
+                width, height, faces, embeddings = detector.detect(path)
             except Exception as exc:
                 print(f"[detect] failed for {photo.filename}: {exc}")
                 continue
             photo.width, photo.height = width, height
-            for fd in faces:
-                session.add(Face(photo_id=photo.id, **fd))
+            new_faces = []
+            for fd, emb in zip(faces, embeddings):
+                face = Face(photo_id=photo.id, **fd)
+                session.add(face)
+                new_faces.append((face, emb))
             photo.processed = True
             session.add(photo)
             session.commit()
+            for face, emb in new_faces:
+                if emb is not None:
+                    recognize.cache_set(face.id, emb)
             print(f"[detect] {photo.filename}: {len(faces)} face(s)")
 
 

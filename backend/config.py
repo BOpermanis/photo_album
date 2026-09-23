@@ -11,4 +11,12 @@ PORT = 8000
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 
+# Face recognition (in-memory Annoy index of user-confirmed reference faces).
+EMBED_DIM = 512
+ANNOY_N_TREES = 10
+# Cosine similarity threshold for surfacing a name suggestion (user confirms).
+RECOGNITION_THRESHOLD = 0.35
+ANNOY_PATH = DATA_DIR / "face_index.ann"
+ANNOY_META_PATH = DATA_DIR / "face_index.json"
+
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)

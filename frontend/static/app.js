@@ -267,10 +267,12 @@ async function viewPhotoDetail(id) {
       );
       stage.appendChild(box);
 
+      const suggested = !named && f.suggested_person_name != null;
       const item = el(`
         <div class="face-item ${named ? "named" : ""}" data-fid="${f.id}">
           <div><span class="num-pill">${i + 1}</span>
             <span class="muted"> confidence ${(f.confidence * 100).toFixed(0)}%</span></div>
+          ${suggested ? `<div class="suggestion">Looks like <strong>${esc(f.suggested_person_name)}</strong> (${(f.suggested_score * 100).toFixed(0)}%) <button class="confirm">Confirm</button></div>` : ""}
           <div class="row">
             <input type="text" list="${datalistId}" placeholder="Type a name…"
               value="${named ? esc(f.person_name) : ""}" />
@@ -283,6 +285,19 @@ async function viewPhotoDetail(id) {
         </div>
       `);
       side.appendChild(item);
+
+      const confirmBtn = item.querySelector(".confirm");
+      if (confirmBtn)
+        confirmBtn.addEventListener("click", async () => {
+          try {
+            await postJSON(`/api/faces/${f.id}/assign`, {
+              person_id: f.suggested_person_id,
+            });
+            await reload();
+          } catch (e) {
+            alert(e.message);
+          }
+        });
 
       const input = item.querySelector("input");
       const highlight = (on) => {
