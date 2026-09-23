@@ -154,8 +154,26 @@ def get_photo(photo_id: int, session: Session = Depends(get_session)):
         "width": photo.width,
         "height": photo.height,
         "processed": photo.processed,
+        "description": photo.description,
         "faces": [_face_dict(session, f) for f in faces],
     }
+
+
+class DescriptionBody(BaseModel):
+    description: str
+
+
+@app.post("/api/photos/{photo_id}/description")
+def update_description(
+    photo_id: int, body: DescriptionBody, session: Session = Depends(get_session)
+):
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    photo.description = body.description.strip()
+    session.add(photo)
+    session.commit()
+    return {"id": photo.id, "description": photo.description}
 
 
 # ------------------------------- faces ------------------------------------

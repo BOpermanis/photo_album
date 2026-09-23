@@ -22,6 +22,7 @@ class Photo(SQLModel, table=True):
     height: int = 0
     imported_at: datetime = Field(default_factory=_utcnow)
     processed: bool = Field(default=False)
+    description: str = Field(default="")
 
 
 class Face(SQLModel, table=True):

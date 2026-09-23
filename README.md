@@ -25,6 +25,21 @@ python run.py
 
 On startup it prints a QR code and a URL like `http://192.168.x.x:8000`.
 
+## Running under WSL (Windows)
+
+WSL2 sits behind a NAT, so your phone can't reach the WSL IP directly. Forward the
+port from Windows into WSL **once** by running the helper script in an **Administrator
+PowerShell on Windows**:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File \\wsl$\<distro>\home\bruno\repos\photo_album\scripts\wsl-forward.ps1
+```
+
+Replace `<distro>` with your distro name (check with `wsl -l`). The script forwards
+port 8000 to WSL, opens the firewall, and prints the URL to open on your phone.
+
+> The WSL IP changes on reboot — re-run the script after restarting your PC or WSL.
+
 ## Use it from your phone
 
 1. Make sure the phone and laptop are on the **same Wi-Fi**.

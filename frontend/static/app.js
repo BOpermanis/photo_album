@@ -169,7 +169,10 @@ async function viewPhotoDetail(id) {
     <div>
       <a class="back" href="#/photos">← Back to photos</a>
       <div class="detail">
-        <div class="stage" id="stage"></div>
+        <div class="stage-col">
+          <div class="stage" id="stage"></div>
+          <div id="descWrap"></div>
+        </div>
         <div class="side" id="side"></div>
       </div>
     </div>
@@ -178,6 +181,7 @@ async function viewPhotoDetail(id) {
 
   const stage = view.querySelector("#stage");
   const side = view.querySelector("#side");
+  const descWrap = view.querySelector("#descWrap");
 
   let photo, persons;
   try {
@@ -195,6 +199,33 @@ async function viewPhotoDetail(id) {
 
   const W = photo.width || 1;
   const H = photo.height || 1;
+
+  // Description editor (persists across face reloads).
+  const descBox = el(`
+    <div class="desc-box">
+      <label class="desc-label">Description</label>
+      <textarea class="desc-input" rows="3" placeholder="Add a note about this photo…">${esc(photo.description || "")}</textarea>
+      <div class="desc-actions">
+        <button class="save desc-save">Save</button>
+        <span class="desc-status muted"></span>
+      </div>
+    </div>
+  `);
+  descWrap.appendChild(descBox);
+  const descInput = descBox.querySelector(".desc-input");
+  const descStatus = descBox.querySelector(".desc-status");
+  descBox.querySelector(".desc-save").addEventListener("click", async () => {
+    descStatus.textContent = "Saving…";
+    try {
+      await postJSON(`/api/photos/${id}/description`, {
+        description: descInput.value,
+      });
+      photo.description = descInput.value.trim();
+      descStatus.textContent = "Saved";
+    } catch (e) {
+      descStatus.textContent = e.message;
+    }
+  });
 
   // datalist for autocomplete
   const datalistId = "personsList";
