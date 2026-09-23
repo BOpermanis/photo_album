@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+python-multipart
+pillow
+pillow-heif
+numpy
+insightface
+onnxruntime
+qrcode

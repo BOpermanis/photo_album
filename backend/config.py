@@ -1,0 +1,14 @@
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+LIBRARY_DIR = DATA_DIR / "library"
+DB_PATH = DATA_DIR / "app.db"
+FRONTEND_DIR = BASE_DIR / "frontend"
+
+HOST = "0.0.0.0"
+PORT = 8000
+
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+
+LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
