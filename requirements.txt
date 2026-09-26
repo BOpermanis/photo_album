@@ -7,5 +7,6 @@ pillow-heif
 numpy
 insightface
 onnxruntime
+opencv-python
 annoy
 qrcode
