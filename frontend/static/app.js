@@ -152,7 +152,7 @@ async function viewPhotos() {
       else if (p.face_count > 0) badge = `<span class="badge ok">tagged</span>`;
       else badge = `<span class="badge">no faces</span>`;
       const card = el(
-        `<div class="card">${badge}<img loading="lazy" src="/media/${esc(p.filename)}" alt=""/></div>`
+        `<div class="card">${badge}<img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}" alt=""/></div>`
       );
       card.addEventListener("click", () => (location.hash = `#/photo/${p.id}`));
       grid.appendChild(card);
@@ -195,11 +195,11 @@ async function viewPhotoDetail(id) {
     return;
   }
 
-  const img = el(`<img src="/media/${esc(photo.filename)}" alt=""/>`);
+  const img = el(`<img src="/media/${esc(photo.display_filename || photo.filename)}" alt=""/>`);
   stage.appendChild(img);
 
-  const W = photo.width || 1;
-  const H = photo.height || 1;
+  const curW = () => photo.width || 1;
+  const curH = () => photo.height || 1;
 
   // Description editor (persists across face reloads).
   const descBox = el(`
@@ -260,7 +260,7 @@ async function viewPhotoDetail(id) {
       const named = f.person_id != null;
       const box = el(
         `<div class="facebox ${named ? "named" : ""}" data-fid="${f.id}"
-           style="left:${pct(f.x, W)};top:${pct(f.y, H)};width:${pct(f.w, W)};height:${pct(f.h, H)}">
+           style="left:${pct(f.x, curW())};top:${pct(f.y, curH())};width:${pct(f.w, curW())};height:${pct(f.h, curH())}">
            <span class="num">${i + 1}</span>
            ${named ? `<span class="label">${esc(f.person_name)}</span>` : ""}
          </div>`
@@ -349,7 +349,10 @@ async function viewPhotoDetail(id) {
     datalist.innerHTML = "";
     for (const p of persons.persons)
       datalist.appendChild(el(`<option value="${esc(p.name)}"></option>`));
+    const src = `/media/${esc(photo.display_filename || photo.filename)}`;
+    if (!img.src.endsWith(src)) img.src = src;
     render();
+    ensurePolling();
   }
 
   // --- Manual face box drawing ---
@@ -357,6 +360,24 @@ async function viewPhotoDetail(id) {
   const drawHint = el(`<span class="muted draw-hint" hidden>Drag on the photo to mark a face.</span>`);
   stageTools.appendChild(drawBtn);
   stageTools.appendChild(drawHint);
+
+  // --- Perspective correction / crop ---
+  const adjustBtn = el(`<button class="secondary">✂ Adjust / Crop</button>`);
+  stageTools.appendChild(adjustBtn);
+  adjustBtn.addEventListener("click", () => openAdjustEditor(id, reload));
+  if (photo.has_edit) {
+    const resetBtn = el(`<button class="secondary">↩ Revert to original</button>`);
+    stageTools.appendChild(resetBtn);
+    resetBtn.addEventListener("click", async () => {
+      if (!confirm("Discard the crop and go back to the original photo?")) return;
+      try {
+        await postJSON(`/api/photos/${id}/warp/reset`, {});
+        await reload();
+      } catch (e) {
+        alert(e.message);
+      }
+    });
+  }
 
   let drawMode = false;
   function setDrawMode(on) {
@@ -412,10 +433,10 @@ async function viewPhotoDetail(id) {
     if (w < 0.01 || h < 0.01) return; // ignore accidental clicks
     try {
       await postJSON(`/api/photos/${id}/faces`, {
-        x: left * W,
-        y: top * H,
-        w: w * W,
-        h: h * H,
+        x: left * curW(),
+        y: top * curH(),
+        w: w * curW(),
+        h: h * curH(),
       });
       await reload();
     } catch (err) {
@@ -460,14 +481,211 @@ async function viewPhotoDetail(id) {
   };
   window.addEventListener("resize", onResize);
 
-  // Poll while detection is pending.
-  if (!photo.processed) {
-    const timer = setInterval(async () => {
-      if (!document.body.contains(view)) return clearInterval(timer);
+  // Poll while detection is pending (also restarts after a re-crop).
+  let pollTimer = null;
+  function ensurePolling() {
+    if (photo.processed) {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      return;
+    }
+    if (pollTimer) return;
+    pollTimer = setInterval(async () => {
+      if (!document.body.contains(view)) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        return;
+      }
       await reload();
-      if (photo.processed) clearInterval(timer);
     }, 2500);
   }
+  ensurePolling();
+}
+
+// --------------------- Perspective correction editor ---------------------
+async function openAdjustEditor(id, onDone) {
+  let info;
+  try {
+    info = await getJSON(`/api/photos/${id}/adjust`);
+  } catch (e) {
+    alert(e.message);
+    return;
+  }
+
+  const DEFAULT_QUAD = [
+    [0.05, 0.05],
+    [0.95, 0.05],
+    [0.95, 0.95],
+    [0.05, 0.95],
+  ];
+  const clamp = (v) => Math.min(1, Math.max(0, v));
+  const rotateCW = (cs) => cs.map((c) => ({ x: 1 - c.y, y: c.x }));
+
+  const overlay = el(`
+    <div class="editor-overlay">
+      <div class="editor-panel">
+        <div class="editor-head">
+          <strong>Adjust photo</strong>
+          <span class="muted">Drag the 4 corners onto the edges of the real photo.</span>
+        </div>
+        <div class="editor-canvas-wrap"><canvas class="editor-canvas"></canvas></div>
+        <div class="editor-tools">
+          <button class="secondary" data-act="rotate">⟳ Rotate 90°</button>
+          <button class="secondary" data-act="auto">⤢ Auto-detect edges</button>
+          <span class="editor-spacer"></span>
+          <button class="secondary" data-act="cancel">Cancel</button>
+          <button class="save" data-act="apply">Apply</button>
+        </div>
+        <div class="editor-status muted"></div>
+      </div>
+    </div>
+  `);
+  document.body.appendChild(overlay);
+
+  const canvas = overlay.querySelector(".editor-canvas");
+  const ctx = canvas.getContext("2d");
+  const status = overlay.querySelector(".editor-status");
+
+  const ow = info.original_width || 1;
+  const oh = info.original_height || 1;
+
+  let rotation = 0;
+  let corners = (info.suggestion || DEFAULT_QUAD).map(([x, y]) => ({ x, y }));
+  if (info.current && Array.isArray(info.current.points) && info.current.points.length === 4) {
+    rotation = (((info.current.rotation || 0) % 360) + 360) % 360;
+    corners = info.current.points.map(([x, y]) => ({ x, y }));
+  }
+
+  const dispDims = () => (rotation % 180 === 0 ? [ow, oh] : [oh, ow]);
+  const view = { cw: 0, ch: 0 };
+
+  function layout() {
+    const [dw, dh] = dispDims();
+    const maxW = Math.min(window.innerWidth - 80, 900);
+    const maxH = window.innerHeight - 220;
+    const scale = Math.min(maxW / dw, maxH / dh, 1);
+    view.cw = Math.max(1, Math.round(dw * scale));
+    view.ch = Math.max(1, Math.round(dh * scale));
+    canvas.width = view.cw;
+    canvas.height = view.ch;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, view.cw, view.ch);
+    ctx.save();
+    ctx.translate(view.cw / 2, view.ch / 2);
+    ctx.rotate((rotation * Math.PI) / 180);
+    const scale = view.cw / dispDims()[0];
+    ctx.drawImage(img, (-ow * scale) / 2, (-oh * scale) / 2, ow * scale, oh * scale);
+    ctx.restore();
+
+    const pts = corners.map((c) => ({ x: c.x * view.cw, y: c.y * view.ch }));
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#38bdf8";
+    ctx.fillStyle = "rgba(56,189,248,0.12)";
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    pts.forEach((p) => {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+      ctx.fillStyle = "#0ea5e9";
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#fff";
+      ctx.stroke();
+    });
+  }
+
+  const rerender = () => {
+    layout();
+    draw();
+  };
+
+  const img = new Image();
+  img.onload = rerender;
+  img.onerror = () => {
+    status.textContent = "Could not load the original image.";
+  };
+  img.src = `/media/${esc(info.filename || "")}`;
+
+  function canvasPoint(e) {
+    const rect = canvas.getBoundingClientRect();
+    const px = ((e.clientX - rect.left) / rect.width) * view.cw;
+    const py = ((e.clientY - rect.top) / rect.height) * view.ch;
+    return { px, py };
+  }
+
+  let dragIdx = -1;
+  canvas.addEventListener("pointerdown", (e) => {
+    const { px, py } = canvasPoint(e);
+    let best = -1;
+    let bestD = 22 * 22;
+    corners.forEach((c, i) => {
+      const dx = c.x * view.cw - px;
+      const dy = c.y * view.ch - py;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    });
+    if (best >= 0) {
+      dragIdx = best;
+      canvas.setPointerCapture(e.pointerId);
+    }
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (dragIdx < 0) return;
+    const { px, py } = canvasPoint(e);
+    corners[dragIdx] = { x: clamp(px / view.cw), y: clamp(py / view.ch) };
+    draw();
+  });
+  const endDrag = () => (dragIdx = -1);
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+
+  function close() {
+    document.removeEventListener("keydown", onKey);
+    overlay.remove();
+  }
+  function onKey(e) {
+    if (e.key === "Escape") close();
+  }
+  document.addEventListener("keydown", onKey);
+  overlay.addEventListener("pointerdown", (e) => {
+    if (e.target === overlay) close();
+  });
+
+  overlay.querySelector('[data-act="rotate"]').addEventListener("click", () => {
+    rotation = (rotation + 90) % 360;
+    corners = rotateCW(corners);
+    rerender();
+  });
+  overlay.querySelector('[data-act="auto"]').addEventListener("click", () => {
+    let cs = (info.suggestion || DEFAULT_QUAD).map(([x, y]) => ({ x, y }));
+    for (let r = rotation; r > 0; r -= 90) cs = rotateCW(cs);
+    corners = cs;
+    draw();
+  });
+  overlay.querySelector('[data-act="cancel"]').addEventListener("click", close);
+  overlay.querySelector('[data-act="apply"]').addEventListener("click", async () => {
+    status.textContent = "Applying…";
+    try {
+      await postJSON(`/api/photos/${id}/warp`, {
+        rotation,
+        points: corners.map((c) => [c.x, c.y]),
+      });
+      close();
+      await onDone();
+    } catch (e) {
+      status.textContent = e.message;
+    }
+  });
 }
 
 // --------------------------- People ---------------------------
@@ -518,7 +736,7 @@ async function viewPerson(id) {
     const grid = el(`<div class="grid"></div>`);
     for (const p of data.photos) {
       const card = el(
-        `<div class="card"><img loading="lazy" src="/media/${esc(p.filename)}" alt=""/></div>`
+        `<div class="card"><img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}" alt=""/></div>`
       );
       card.addEventListener("click", () => (location.hash = `#/photo/${p.id}`));
       grid.appendChild(card);

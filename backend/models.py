@@ -23,6 +23,15 @@ class Photo(SQLModel, table=True):
     imported_at: datetime = Field(default_factory=_utcnow)
     processed: bool = Field(default=False)
     description: str = Field(default="")
+    # Perspective-corrected copy of the original (empty = none). The original
+    # upload is always kept; faces and display use the edited copy when present.
+    edited_filename: str = Field(default="")
+    # JSON of the last warp: {"rotation": int, "points": [[fx, fy], ...]}.
+    edit_params: str = Field(default="")
+
+    @property
+    def display_filename(self) -> str:
+        return self.edited_filename or self.filename
 
 
 class Face(SQLModel, table=True):

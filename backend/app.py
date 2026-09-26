@@ -10,8 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
+import json
+
 from . import detect
 from . import recognize
+from . import warp
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT
 from .db import get_session, init_db
 from .models import Face, Person, Photo
@@ -114,6 +117,7 @@ def _photo_summary(session: Session, photo: Photo) -> dict:
     return {
         "id": photo.id,
         "filename": photo.filename,
+        "display_filename": photo.display_filename,
         "width": photo.width,
         "height": photo.height,
         "processed": photo.processed,
@@ -133,7 +137,7 @@ def _attach_suggestions(
     if missing:
         try:
             embs = detect.get_detector().embed_photo(
-                LIBRARY_DIR / photo.filename, missing
+                LIBRARY_DIR / photo.display_filename, missing
             )
             for fid, emb in embs.items():
                 recognize.cache_set(fid, emb)
@@ -186,10 +190,12 @@ def get_photo(photo_id: int, session: Session = Depends(get_session)):
     return {
         "id": photo.id,
         "filename": photo.filename,
+        "display_filename": photo.display_filename,
         "width": photo.width,
         "height": photo.height,
         "processed": photo.processed,
         "description": photo.description,
+        "has_edit": bool(photo.edited_filename),
         "faces": face_dicts,
     }
 
@@ -209,6 +215,119 @@ def update_description(
     session.add(photo)
     session.commit()
     return {"id": photo.id, "description": photo.description}
+
+
+# --------------------------- perspective correction -----------------------
+def _reset_photo_faces(session: Session, photo: Photo) -> list[int]:
+    """Drop existing detections so the worker re-processes the current image.
+
+    Returns the removed face ids; the caller must drop them from the
+    recognition index *after* committing, since that opens its own DB
+    connection and would otherwise deadlock on SQLite's write lock.
+    """
+    faces = session.exec(select(Face).where(Face.photo_id == photo.id)).all()
+    ids = [f.id for f in faces]
+    for f in faces:
+        session.delete(f)
+    photo.processed = False
+    return ids
+
+
+@app.get("/api/photos/{photo_id}/adjust")
+def adjust_info(photo_id: int, session: Session = Depends(get_session)):
+    """Original image dimensions plus a best-guess quad for the corner editor."""
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    original = LIBRARY_DIR / photo.filename
+    try:
+        suggestion = warp.auto_detect_quad(original)
+    except Exception as exc:  # pragma: no cover - detection is best-effort
+        print(f"[warp] auto-detect failed for {photo.filename}: {exc}")
+        suggestion = None
+    if suggestion is None:
+        suggestion = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+
+    with warp._load_rgb(original) as im:  # noqa: SLF001 - internal helper reuse
+        ow, oh = im.size
+
+    current = None
+    if photo.edit_params:
+        try:
+            current = json.loads(photo.edit_params)
+        except Exception:
+            current = None
+
+    return {
+        "original_width": ow,
+        "original_height": oh,
+        "suggestion": suggestion,
+        "current": current,
+        "has_edit": bool(photo.edited_filename),
+        "filename": photo.filename,
+    }
+
+
+class WarpBody(BaseModel):
+    rotation: int = 0
+    points: List[List[float]]
+
+
+@app.post("/api/photos/{photo_id}/warp")
+def warp_photo(
+    photo_id: int, body: WarpBody, session: Session = Depends(get_session)
+):
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if len(body.points) != 4:
+        raise HTTPException(status_code=400, detail="Exactly 4 points required")
+    rotation = int(body.rotation) % 360
+    if rotation not in (0, 90, 180, 270):
+        raise HTTPException(status_code=400, detail="Rotation must be a multiple of 90")
+
+    try:
+        stored_name, w, h = warp.warp_and_save(
+            LIBRARY_DIR / photo.filename, rotation, body.points
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Warp failed: {exc}")
+
+    old_edited = photo.edited_filename
+    photo.edited_filename = stored_name
+    photo.width, photo.height = w, h
+    photo.edit_params = json.dumps({"rotation": rotation, "points": body.points})
+    removed = _reset_photo_faces(session, photo)
+    session.add(photo)
+    session.commit()
+    for fid in removed:
+        recognize.remove(fid)
+    if old_edited and old_edited != stored_name:
+        warp.delete_file(old_edited)
+    return {"id": photo.id, "display_filename": photo.display_filename}
+
+
+@app.post("/api/photos/{photo_id}/warp/reset")
+def reset_warp(photo_id: int, session: Session = Depends(get_session)):
+    """Discard the corrected copy and go back to the original upload."""
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if not photo.edited_filename:
+        return {"id": photo.id, "display_filename": photo.display_filename}
+
+    old_edited = photo.edited_filename
+    with warp._load_rgb(LIBRARY_DIR / photo.filename) as im:  # noqa: SLF001
+        photo.width, photo.height = im.size
+    photo.edited_filename = ""
+    photo.edit_params = ""
+    removed = _reset_photo_faces(session, photo)
+    session.add(photo)
+    session.commit()
+    for fid in removed:
+        recognize.remove(fid)
+    warp.delete_file(old_edited)
+    return {"id": photo.id, "display_filename": photo.display_filename}
 
 
 # ------------------------------- faces ------------------------------------
@@ -258,7 +377,7 @@ def _index_reference_face(session: Session, face: Face, person_id: int) -> None:
         if photo:
             try:
                 embs = detect.get_detector().embed_photo(
-                    LIBRARY_DIR / photo.filename, [face]
+                    LIBRARY_DIR / photo.display_filename, [face]
                 )
                 emb = embs.get(face.id)
                 if emb is not None:

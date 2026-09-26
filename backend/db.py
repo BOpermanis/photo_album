@@ -22,6 +22,14 @@ def _run_migrations() -> None:
         cols = {row[1] for row in conn.execute(text("PRAGMA table_info(photo)"))}
         if "description" not in cols:
             conn.execute(text("ALTER TABLE photo ADD COLUMN description TEXT DEFAULT ''"))
+        if "edited_filename" not in cols:
+            conn.execute(
+                text("ALTER TABLE photo ADD COLUMN edited_filename TEXT DEFAULT ''")
+            )
+        if "edit_params" not in cols:
+            conn.execute(
+                text("ALTER TABLE photo ADD COLUMN edit_params TEXT DEFAULT ''")
+            )
 
 
 def get_session():

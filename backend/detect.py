@@ -109,7 +109,7 @@ def process_pending() -> None:
             return
         detector = get_detector()
         for photo in pending:
-            path = LIBRARY_DIR / photo.filename
+            path = LIBRARY_DIR / photo.display_filename
             try:
                 width, height, faces, embeddings = detector.detect(path)
             except Exception as exc:
