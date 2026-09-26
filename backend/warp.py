@@ -56,29 +56,68 @@ def auto_detect_quad(path) -> Optional[List[List[float]]]:
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
     scale = 1000.0 / max(W, H) if max(W, H) > 1000 else 1.0
-    small = cv2.resize(gray, (max(1, int(W * scale)), max(1, int(H * scale))))
-    blur = cv2.GaussianBlur(small, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8))
+    sw, sh = max(1, int(W * scale)), max(1, int(H * scale))
+    small = cv2.resize(gray, (sw, sh))
+    small = cv2.bilateralFilter(small, 9, 75, 75)
+    img_area = sw * sh
 
-    contours, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    img_area = small.shape[0] * small.shape[1]
-    best = None
-    best_area = 0.0
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            area = cv2.contourArea(approx)
-            if area > best_area and area > 0.2 * img_area:
-                best_area, best = area, approx
-    if best is None:
+    # Build several edge maps; real "photo of a photo" edges vary a lot, so we
+    # union Canny (auto + fixed thresholds) with an Otsu-threshold boundary.
+    med = float(np.median(small))
+    lo = int(max(0, 0.66 * med))
+    hi = int(min(255, 1.33 * med))
+    edge_maps = [
+        cv2.Canny(small, lo, hi),
+        cv2.Canny(small, 50, 150),
+        cv2.Canny(small, 30, 90),
+    ]
+    _, otsu = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edge_maps.append(cv2.morphologyEx(otsu, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)))
+
+    kernel = np.ones((5, 5), np.uint8)
+    candidates = []  # (area, quad_pts_smallscale)
+    for edges in edge_maps:
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        closed = cv2.dilate(closed, kernel, iterations=1)
+        contours, _ = cv2.findContours(
+            closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+            area = cv2.contourArea(c)
+            if area < 0.10 * img_area:
+                continue
+            peri = cv2.arcLength(c, True)
+            quad = None
+            for eps in (0.02, 0.03, 0.05, 0.08):
+                approx = cv2.approxPolyDP(c, eps * peri, True)
+                if len(approx) == 4 and cv2.isContourConvex(approx):
+                    quad = approx.reshape(4, 2).astype(np.float32)
+                    break
+            if quad is None:
+                # Fall back to the minimum-area rectangle of a big contour.
+                box = cv2.boxPoints(cv2.minAreaRect(c))
+                rect_area = cv2.contourArea(box.astype(np.float32))
+                if rect_area >= 0.25 * img_area and area >= 0.6 * rect_area:
+                    quad = box.astype(np.float32)
+            if quad is not None:
+                candidates.append((cv2.contourArea(quad), quad))
+
+    if not candidates:
         return None
 
-    pts = _order_corners(best.reshape(4, 2).astype(np.float32) / scale)
-    return [[float(x / W), float(y / H)] for x, y in pts]
+    # Prefer the largest quad that still leaves a margin (i.e. not the whole
+    # frame, which usually means it locked onto the image border, not the photo).
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    best = None
+    for area, quad in candidates:
+        if area <= 0.98 * img_area:
+            best = quad
+            break
+    if best is None:
+        best = candidates[0][1]
+
+    pts = _order_corners(best / scale)
+    return [[float(np.clip(x / W, 0, 1)), float(np.clip(y / H, 0, 1))] for x, y in pts]
 
 
 def _rotate(im: Image.Image, rotation: int) -> Image.Image:

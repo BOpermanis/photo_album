@@ -245,6 +245,7 @@ def adjust_info(photo_id: int, session: Session = Depends(get_session)):
     except Exception as exc:  # pragma: no cover - detection is best-effort
         print(f"[warp] auto-detect failed for {photo.filename}: {exc}")
         suggestion = None
+    detected = suggestion is not None
     if suggestion is None:
         suggestion = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
 
@@ -262,6 +263,7 @@ def adjust_info(photo_id: int, session: Session = Depends(get_session)):
         "original_width": ow,
         "original_height": oh,
         "suggestion": suggestion,
+        "detected": detected,
         "current": current,
         "has_edit": bool(photo.edited_filename),
         "filename": photo.filename,

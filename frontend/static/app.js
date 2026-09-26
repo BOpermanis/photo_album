@@ -557,6 +557,11 @@ async function openAdjustEditor(id, onDone) {
     rotation = (((info.current.rotation || 0) % 360) + 360) % 360;
     corners = info.current.points.map(([x, y]) => ({ x, y }));
   }
+  status.textContent = info.current
+    ? "Loaded your previous crop."
+    : info.detected
+    ? "Corners set from auto-detected edges — drag to fine-tune."
+    : "Couldn't auto-detect edges — drag the corners onto the photo.";
 
   const dispDims = () => (rotation % 180 === 0 ? [ow, oh] : [oh, ow]);
   const view = { cw: 0, ch: 0 };
@@ -671,6 +676,9 @@ async function openAdjustEditor(id, onDone) {
     for (let r = rotation; r > 0; r -= 90) cs = rotateCW(cs);
     corners = cs;
     draw();
+    status.textContent = info.detected
+      ? "Snapped to detected edges. Fine-tune by dragging."
+      : "No clear photo edges found — drag the corners manually.";
   });
   overlay.querySelector('[data-act="cancel"]').addEventListener("click", close);
   overlay.querySelector('[data-act="apply"]').addEventListener("click", async () => {
