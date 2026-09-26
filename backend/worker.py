@@ -2,9 +2,10 @@
 
 Each child process owns its own SQLite engine and its own face detector (model
 load is per-process). Jobs are claimed atomically from the queue so no two
-workers touch the same row. Handlers keep detection/embedding on the ORIGINAL
-image and map polygons into aligned space via the alignment homography, so an
-`align` job never re-runs detection.
+workers touch the same row. Detection/embedding run on the ALIGNED image when a
+corrected copy exists (the original is the fallback); polygons are back-mapped
+into original space via the inverse homography. An `align` job only remaps
+existing polygons and never re-runs detection.
 """
 
 import json
@@ -51,16 +52,23 @@ def _forward_matrix(photo: Photo):
 
 
 # ------------------------------- job handlers -----------------------------
-def handle_detect(engine, detector, photo_id: int) -> None:
-    """Detect + embed on the ORIGINAL; store polygons in original space and,
-    when an aligned copy already exists, map them into aligned space too."""
+def _run_detection(engine, detector, photo_id: int, label: str) -> None:
+    """Detect + embed on the aligned image when a corrected copy exists (falling
+    back to the original). When run on the aligned copy, each polygon is
+    back-mapped into original space via the inverse homography; when run on the
+    original, it is mapped forward into aligned space if an aligned copy exists."""
     with Session(engine) as session:
         photo = session.get(Photo, photo_id)
         if photo is None:
             return
-        original_path = LIBRARY_DIR / photo.filename
+        matrix = _forward_matrix(photo)
+        use_aligned = bool(photo.edited_filename) and matrix is not None
+        detect_name = photo.edited_filename if use_aligned else photo.filename
+        detect_path = LIBRARY_DIR / detect_name
+        has_edited = bool(photo.edited_filename)
 
-    width, height, results, embeddings = detector.detect(original_path)
+    width, height, results, embeddings = detector.detect(detect_path)
+    inverse = np.linalg.inv(matrix) if use_aligned else None
 
     with Session(engine) as session:
         photo = session.get(Photo, photo_id)
@@ -68,20 +76,32 @@ def handle_detect(engine, detector, photo_id: int) -> None:
             return
         for old in session.exec(select(Face).where(Face.photo_id == photo_id)).all():
             session.delete(old)
-        photo.original_width, photo.original_height = width, height
-        if not photo.edited_filename:
+        if use_aligned:
             photo.width, photo.height = width, height
-        matrix = _forward_matrix(photo) if photo.edited_filename else None
+            forward = None
+        else:
+            photo.original_width, photo.original_height = width, height
+            if not has_edited:
+                photo.width, photo.height = width, height
+            # Aligned copy exists but original dims were unknown until now: rebuild
+            # the forward matrix with the fresh dims so poly_aligned can be filled.
+            forward = _forward_matrix(photo) if has_edited else None
         for fd, emb in zip(results, embeddings):
-            poly_o = _rect_poly(fd["x"], fd["y"], fd["w"], fd["h"])
-            poly_a = json.dumps(warp.map_points(matrix, poly_o)) if matrix is not None else ""
+            rect = _rect_poly(fd["x"], fd["y"], fd["w"], fd["h"])
+            if use_aligned:
+                poly_a = rect
+                poly_o = warp.map_points(inverse, rect)
+            else:
+                poly_o = rect
+                poly_a = warp.map_points(forward, rect) if forward is not None else None
+            x, y, w, h = _bbox(poly_o)
             session.add(
                 Face(
                     photo_id=photo_id,
-                    x=fd["x"], y=fd["y"], w=fd["w"], h=fd["h"],
+                    x=x, y=y, w=w, h=h,
                     confidence=fd["confidence"],
                     poly_original=json.dumps(poly_o),
-                    poly_aligned=poly_a,
+                    poly_aligned=json.dumps(poly_a) if poly_a is not None else "",
                     embedding=emb.tobytes() if emb is not None else None,
                 )
             )
@@ -89,7 +109,11 @@ def handle_detect(engine, detector, photo_id: int) -> None:
         session.add(photo)
         session.commit()
         count = len(results)
-    print(f"[worker] detect photo={photo_id}: {count} face(s)")
+    print(f"[worker] {label} photo={photo_id}: {count} face(s)")
+
+
+def handle_detect(engine, detector, photo_id: int) -> None:
+    _run_detection(engine, detector, photo_id, "detect")
 
 
 def handle_align(engine, detector, photo_id: int) -> None:
@@ -131,54 +155,9 @@ def handle_align(engine, detector, photo_id: int) -> None:
 
 
 def handle_rerun_detect(engine, detector, photo_id: int) -> None:
-    """User-requested re-detection: run on the aligned image when present and
-    back-map polygons into original space; otherwise behave like detect."""
-    with Session(engine) as session:
-        photo = session.get(Photo, photo_id)
-        if photo is None:
-            return
-        display_path = LIBRARY_DIR / photo.display_filename
-        aligned = bool(photo.edited_filename)
-        matrix = _forward_matrix(photo) if aligned else None
-
-    width, height, results, embeddings = detector.detect(display_path)
-    inverse = np.linalg.inv(matrix) if matrix is not None else None
-
-    with Session(engine) as session:
-        photo = session.get(Photo, photo_id)
-        if photo is None:
-            return
-        for old in session.exec(select(Face).where(Face.photo_id == photo_id)).all():
-            session.delete(old)
-        if aligned:
-            photo.width, photo.height = width, height
-        else:
-            photo.original_width, photo.original_height = width, height
-            photo.width, photo.height = width, height
-        for fd, emb in zip(results, embeddings):
-            rect = _rect_poly(fd["x"], fd["y"], fd["w"], fd["h"])
-            if aligned and inverse is not None:
-                poly_a = rect
-                poly_o = warp.map_points(inverse, rect)
-            else:
-                poly_o = rect
-                poly_a = None
-            x, y, w, h = _bbox(poly_o)
-            session.add(
-                Face(
-                    photo_id=photo_id,
-                    x=x, y=y, w=w, h=h,
-                    confidence=fd["confidence"],
-                    poly_original=json.dumps(poly_o),
-                    poly_aligned=json.dumps(poly_a) if poly_a is not None else "",
-                    embedding=emb.tobytes() if emb is not None else None,
-                )
-            )
-        photo.processed = True
-        session.add(photo)
-        session.commit()
-        count = len(results)
-    print(f"[worker] rerun_detect photo={photo_id}: {count} face(s)")
+    """User-requested re-detection: identical to the initial detect, i.e. run on
+    the aligned image when present with the original as fallback."""
+    _run_detection(engine, detector, photo_id, "rerun_detect")
 
 
 _HANDLERS = {

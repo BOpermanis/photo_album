@@ -6,7 +6,8 @@ pillow
 pillow-heif
 numpy
 insightface
-onnxruntime
+# GPU build; auto-falls back to CPUExecutionProvider when no CUDA GPU is present.
+onnxruntime-gpu
 opencv-python
 annoy
 qrcode

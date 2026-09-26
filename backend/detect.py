@@ -11,15 +11,34 @@ except Exception:  # pragma: no cover - HEIC support is optional
     pass
 
 
+def _providers_and_ctx():
+    """Prefer the GPU (CUDA) when onnxruntime exposes it, else fall back to CPU.
+
+    Returns the onnxruntime provider list plus the InsightFace ``ctx_id``
+    (>= 0 selects a GPU device, -1 forces CPU).
+    """
+    try:
+        import onnxruntime as ort
+
+        available = set(ort.get_available_providers())
+    except Exception:  # pragma: no cover - onnxruntime import failure
+        available = set()
+    if "CUDAExecutionProvider" in available:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"], 0
+    return ["CPUExecutionProvider"], -1
+
+
 class FaceDetector:
     def __init__(self) -> None:
         from insightface.app import FaceAnalysis
 
+        providers, ctx_id = _providers_and_ctx()
+        print(f"[detect] onnxruntime providers={providers} ctx_id={ctx_id}")
         self.app = FaceAnalysis(
             allowed_modules=["detection", "recognition"],
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
-        self.app.prepare(ctx_id=0, det_size=(640, 640))
+        self.app.prepare(ctx_id=ctx_id, det_size=(640, 640))
 
     def detect(self, path):
         with Image.open(path) as im:
