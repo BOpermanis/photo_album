@@ -5,6 +5,7 @@ import subprocess
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
+from urllib.parse import quote
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
@@ -13,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
-from . import jobs, recognize, warp, worker
+from . import export, jobs, recognize, warp, worker
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT
 from .db import engine, get_session, init_db
 from .models import Album, Face, Job, Person, Photo
@@ -87,6 +88,9 @@ async def lifespan(app: FastAPI):
         requeued = jobs.requeue_stale(session)
         if requeued:
             print(f"[jobs] requeued {requeued} stale job(s)")
+        cleared = jobs.clear_done(session)
+        if cleared:
+            print(f"[jobs] cleared {cleared} finished job(s)")
     app.state.worker_pool = worker.start_pool()
     _print_qr()
     yield
@@ -322,6 +326,37 @@ def update_description(
     session.add(photo)
     session.commit()
     return {"id": photo.id, "description": photo.description}
+
+
+def _purge_photo(session: Session, photo: Photo) -> tuple[list[int], list[str]]:
+    """Delete a photo's faces, queued jobs and photo row (without committing).
+
+    Returns the reference-face ids to drop from the recognition index and the
+    image files to unlink; the caller commits, then applies both side effects.
+    """
+    faces = session.exec(select(Face).where(Face.photo_id == photo.id)).all()
+    ref_ids = [f.id for f in faces if f.person_id is not None]
+    for f in faces:
+        session.delete(f)
+    for job in session.exec(select(Job).where(Job.photo_id == photo.id)).all():
+        session.delete(job)
+    files = [name for name in (photo.filename, photo.edited_filename) if name]
+    session.delete(photo)
+    return ref_ids, files
+
+
+@app.delete("/api/photos/{photo_id}")
+def delete_photo(photo_id: int, session: Session = Depends(get_session)):
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    ref_ids, files = _purge_photo(session, photo)
+    session.commit()
+    for face_id in ref_ids:
+        recognize.remove(face_id)
+    for name in files:
+        warp.delete_file(name)
+    return {"status": "deleted", "id": photo_id}
 
 
 # --------------------------- perspective correction -----------------------
@@ -681,6 +716,47 @@ def rename_album(
     session.add(album)
     session.commit()
     return {"id": album.id, "name": album.name}
+
+
+@app.delete("/api/albums/{album_id}")
+def delete_album(album_id: int, session: Session = Depends(get_session)):
+    album = session.get(Album, album_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    ref_ids: list[int] = []
+    files: list[str] = []
+    for photo in session.exec(select(Photo).where(Photo.album_id == album_id)).all():
+        photo_refs, photo_files = _purge_photo(session, photo)
+        ref_ids += photo_refs
+        files += photo_files
+    session.delete(album)
+    session.commit()
+    for face_id in ref_ids:
+        recognize.remove(face_id)
+    for name in files:
+        warp.delete_file(name)
+    return {"status": "deleted", "id": album_id}
+
+
+@app.get("/api/albums/{album_id}/export")
+def export_album(album_id: int, session: Session = Depends(get_session)):
+    album = session.get(Album, album_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    pdf = export.build_album_pdf(session, album)
+    # HTTP headers are latin-1; keep an ASCII fallback and hand the real UTF-8
+    # (e.g. Latvian) name via RFC 5987 filename* for modern browsers.
+    ascii_name = "".join(
+        c if c.isascii() and (c.isalnum() or c in " -_") else "_" for c in album.name
+    ).strip()
+    fallback = f"{ascii_name or 'album'}.pdf"
+    utf8_name = quote(f"{album.name}.pdf")
+    headers = {
+        "Content-Disposition": (
+            f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{utf8_name}"
+        )
+    }
+    return StreamingResponse(pdf, media_type="application/pdf", headers=headers)
 
 
 # ------------------------------- jobs -------------------------------------

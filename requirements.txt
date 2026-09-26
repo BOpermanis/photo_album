@@ -10,3 +10,4 @@ onnxruntime
 opencv-python
 annoy
 qrcode
+reportlab

@@ -38,6 +38,55 @@ function esc(s) {
   );
 }
 
+// Danger confirmation: the user must type "delete" before the action proceeds.
+// Resolves true when confirmed, false when cancelled/dismissed.
+function confirmDelete(message) {
+  return new Promise((resolve) => {
+    const overlay = el(`
+      <div class="editor-overlay">
+        <div class="editor-panel confirm-panel">
+          <div class="editor-head">
+            <strong>Confirm deletion</strong>
+            <span class="muted">${esc(message)}</span>
+          </div>
+          <label class="muted">Type <strong>delete</strong> to confirm.</label>
+          <input type="text" class="confirm-input" placeholder="delete" autocomplete="off" />
+          <div class="editor-tools">
+            <span class="editor-spacer"></span>
+            <button class="secondary" data-act="cancel">Cancel</button>
+            <button class="danger" data-act="confirm" disabled>Delete</button>
+          </div>
+        </div>
+      </div>
+    `);
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector(".confirm-input");
+    const confirmBtn = overlay.querySelector('[data-act="confirm"]');
+    const matches = () => input.value.trim().toLowerCase() === "delete";
+    const done = (result) => {
+      document.removeEventListener("keydown", onKey);
+      overlay.remove();
+      resolve(result);
+    };
+    function onKey(e) {
+      if (e.key === "Escape") done(false);
+      else if (e.key === "Enter" && matches()) done(true);
+    }
+    input.addEventListener("input", () => {
+      confirmBtn.disabled = !matches();
+    });
+    confirmBtn.addEventListener("click", () => matches() && done(true));
+    overlay
+      .querySelector('[data-act="cancel"]')
+      .addEventListener("click", () => done(false));
+    overlay.addEventListener("pointerdown", (e) => {
+      if (e.target === overlay) done(false);
+    });
+    document.addEventListener("keydown", onKey);
+    input.focus();
+  });
+}
+
 // --------------------------- Router ---------------------------
 const routes = [
   [/^\/albums$/, viewAlbums],
@@ -456,6 +505,7 @@ async function viewPhotoDetail(id) {
   const adjustBtn = el(`<button class="secondary">✂ Adjust / Crop</button>`);
   const rerunBtn = el(`<button class="secondary">↻ Rerun face detection</button>`);
   const resetBtn = el(`<button class="secondary" hidden>↩ Revert to original</button>`);
+  const deletePhotoBtn = el(`<button class="danger">🗑 Delete photo</button>`);
   const spaceToggle = el(`
     <span class="space-toggle" hidden>
       <button data-sp="aligned">Aligned</button>
@@ -467,6 +517,7 @@ async function viewPhotoDetail(id) {
   stageTools.appendChild(adjustBtn);
   stageTools.appendChild(rerunBtn);
   stageTools.appendChild(resetBtn);
+  stageTools.appendChild(deletePhotoBtn);
   stageTools.appendChild(spaceToggle);
   stageTools.appendChild(drawHint);
   stageTools.appendChild(statusNote);
@@ -487,6 +538,19 @@ async function viewPhotoDetail(id) {
       spaceLocked = false;
       space = "original";
       await reload();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  deletePhotoBtn.addEventListener("click", async () => {
+    const ok = await confirmDelete(
+      "This permanently removes the photo and its face tags."
+    );
+    if (!ok) return;
+    try {
+      await del(`/api/photos/${id}`);
+      closeStream();
+      location.hash = "#/photos";
     } catch (e) {
       alert(e.message);
     }
@@ -969,6 +1033,8 @@ async function viewAlbums() {
           </div>
           <div class="album-actions">
             <button class="work">${isActive ? "✓ Working here" : "Work in this album"}</button>
+            <button class="secondary export-pdf">Export PDF</button>
+            <button class="danger delete-album">Delete</button>
           </div>
         </div>
       `);
@@ -990,6 +1056,41 @@ async function viewAlbums() {
       card.querySelector(".work").addEventListener("click", () => {
         setActiveAlbum(a.id, nameInput.value.trim() || a.name);
         location.hash = "#/photos";
+      });
+      card.querySelector(".export-pdf").addEventListener("click", (e) => {
+        const btn = e.currentTarget;
+        if (!a.image_count) {
+          alert("This album has no photos to export.");
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = "Preparing…";
+        const iframe = document.createElement("iframe");
+        iframe.style.display = "none";
+        iframe.src = `/api/albums/${a.id}/export`;
+        document.body.appendChild(iframe);
+        setTimeout(() => {
+          iframe.remove();
+          btn.disabled = false;
+          btn.textContent = "Export PDF";
+        }, 4000);
+      });
+      card.querySelector(".delete-album").addEventListener("click", async () => {
+        const ok = await confirmDelete(
+          `Delete “${a.name}” and its ${a.image_count} photo(s)? This cannot be undone.`
+        );
+        if (!ok) return;
+        try {
+          await del(`/api/albums/${a.id}`);
+          if (getActiveAlbum() && getActiveAlbum().id === a.id) {
+            localStorage.removeItem("activeAlbumId");
+            localStorage.removeItem("activeAlbumName");
+            updateAlbumChip();
+          }
+          await load();
+        } catch (e) {
+          alert(e.message);
+        }
       });
       list.appendChild(card);
     }

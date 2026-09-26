@@ -80,6 +80,21 @@ def mark(session: Session, job_id: int, status: str, error: str = "") -> None:
     session.commit()
 
 
+def delete(session: Session, job_id: int) -> None:
+    job = session.get(Job, job_id)
+    if job is not None:
+        session.delete(job)
+        session.commit()
+
+
+def clear_done(session: Session) -> int:
+    """Drop every successfully finished job. Failed jobs are kept so their
+    error/traceback stays available for debugging."""
+    res = session.execute(text("DELETE FROM job WHERE status='done'"))
+    session.commit()
+    return res.rowcount
+
+
 def requeue_stale(session: Session) -> int:
     """Reset jobs stuck in `running` (e.g. from a crashed process) to pending.
 

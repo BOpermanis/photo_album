@@ -10,6 +10,7 @@ image and map polygons into aligned space via the alignment homography, so an
 import json
 import multiprocessing as mp
 import os
+import traceback
 
 import numpy as np
 from sqlmodel import Session, select
@@ -211,11 +212,12 @@ def _worker_main(stop_event, kinds=None, load_detector=True, poll=WORKER_POLL_IN
                 raise ValueError(f"unknown job kind: {kind}")
             handler(engine, detector, target_photo)
             with Session(engine) as session:
-                jobs.mark(session, job_id, "done")
+                jobs.delete(session, job_id)
         except Exception as exc:  # pragma: no cover - worker keeps running
             message = f"{type(exc).__name__}: {exc}"
+            # Store the full traceback so failed jobs are debuggable from the UI.
             with Session(engine) as session:
-                jobs.mark(session, job_id, "failed", error=message)
+                jobs.mark(session, job_id, "failed", error=traceback.format_exc())
             print(f"[worker {pid}] {kind} photo={target_photo} FAILED: {message}")
 
 
