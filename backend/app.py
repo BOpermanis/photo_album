@@ -2,12 +2,13 @@ import json
 import platform
 import socket
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
@@ -224,10 +225,14 @@ def get_photo(photo_id: int, session: Session = Depends(get_session)):
     photo = session.get(Photo, photo_id)
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
-    faces = session.exec(select(Face).where(Face.photo_id == photo_id)).all()
+    return _photo_detail(session, photo)
+
+
+def _photo_detail(session: Session, photo: Photo) -> dict:
+    faces = session.exec(select(Face).where(Face.photo_id == photo.id)).all()
     face_dicts = [_face_dict(session, f) for f in faces]
     _attach_suggestions(session, photo, faces, face_dicts)
-    flags = jobs.pending_flags(session, photo_id)
+    flags = jobs.pending_flags(session, photo.id)
     return {
         "id": photo.id,
         "album_id": photo.album_id,
@@ -245,6 +250,61 @@ def get_photo(photo_id: int, session: Session = Depends(get_session)):
         "align_pending": flags["align_pending"],
         "faces": face_dicts,
     }
+
+
+def _photo_state_sig(session: Session, photo_id: int):
+    """Cheap fingerprint of the fields the detail view reacts to, or None."""
+    photo = session.get(Photo, photo_id)
+    if photo is None:
+        return None
+    flags = jobs.pending_flags(session, photo_id)
+    face_count = session.exec(
+        select(func.count()).select_from(Face).where(Face.photo_id == photo_id)
+    ).one()
+    return (
+        photo.processed,
+        flags["detect_pending"],
+        flags["align_pending"],
+        photo.edited_filename or "",
+        photo.width,
+        photo.height,
+        int(face_count),
+    )
+
+
+@app.get("/api/photos/{photo_id}/stream")
+def stream_photo(photo_id: int):
+    """Server-sent events: push the photo detail whenever background work
+    (align/detect) changes its state, so the client never has to poll.
+
+    Runs as a sync generator, so Starlette iterates it in a threadpool and the
+    `time.sleep` never blocks the event loop.
+    """
+
+    def gen():
+        last = object()
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            with Session(engine) as session:
+                sig = _photo_state_sig(session, photo_id)
+                if sig is None:
+                    yield "event: gone\ndata: {}\n\n"
+                    return
+                if sig != last:
+                    last = sig
+                    detail = _photo_detail(session, session.get(Photo, photo_id))
+                    yield f"data: {json.dumps(detail)}\n\n"
+                    still_pending = sig[1] or sig[2] or not sig[0]
+                    if not still_pending:
+                        yield "event: done\ndata: {}\n\n"
+                        return
+            time.sleep(0.15)
+        yield "event: timeout\ndata: {}\n\n"
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(
+        gen(), media_type="text/event-stream", headers=headers
+    )
 
 
 class DescriptionBody(BaseModel):

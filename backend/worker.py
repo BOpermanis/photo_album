@@ -15,7 +15,12 @@ import numpy as np
 from sqlmodel import Session, select
 
 from . import db, jobs, warp
-from .config import LIBRARY_DIR, WORKER_POLL_INTERVAL, WORKER_PROCESSES
+from .config import (
+    INTERACTIVE_POLL_INTERVAL,
+    LIBRARY_DIR,
+    WORKER_POLL_INTERVAL,
+    WORKER_PROCESSES,
+)
 from .models import Face, Photo
 
 
@@ -183,18 +188,21 @@ _HANDLERS = {
 
 
 # ------------------------------- pool plumbing ----------------------------
-def _worker_main(stop_event) -> None:
+def _worker_main(stop_event, kinds=None, load_detector=True, poll=WORKER_POLL_INTERVAL) -> None:
     engine = db.make_engine()
-    from .detect import get_detector
+    detector = None
+    if load_detector:
+        from .detect import get_detector
 
-    detector = get_detector()
+        detector = get_detector()
     pid = os.getpid()
-    print(f"[worker {pid}] ready")
+    lane = "+".join(kinds) if kinds else "all"
+    print(f"[worker {pid}] ready ({lane})")
     while not stop_event.is_set():
         with Session(engine) as session:
-            claimed = jobs.claim_next(session, pid)
+            claimed = jobs.claim_next(session, pid, kinds)
         if claimed is None:
-            stop_event.wait(WORKER_POLL_INTERVAL)
+            stop_event.wait(poll)
             continue
         job_id, target_photo, kind, _payload = claimed
         try:
@@ -213,7 +221,13 @@ def _worker_main(stop_event) -> None:
 
 def start_pool():
     """Spawn the worker processes. Spawn (not fork) avoids sharing SQLite and
-    onnxruntime state across the process boundary."""
+    onnxruntime state across the process boundary.
+
+    Alongside the detection workers we start one dedicated align-only lane. An
+    `align` job just warps the image and remaps polygons (no detector model),
+    so this lightweight worker lets a crop complete immediately instead of
+    waiting behind slow detections that occupy every general worker.
+    """
     ctx = mp.get_context("spawn")
     stop_event = ctx.Event()
     procs = []
@@ -221,6 +235,18 @@ def start_pool():
         proc = ctx.Process(target=_worker_main, args=(stop_event,), daemon=True)
         proc.start()
         procs.append(proc)
+    interactive = ctx.Process(
+        target=_worker_main,
+        args=(stop_event,),
+        kwargs={
+            "kinds": ("align",),
+            "load_detector": False,
+            "poll": INTERACTIVE_POLL_INTERVAL,
+        },
+        daemon=True,
+    )
+    interactive.start()
+    procs.append(interactive)
     return stop_event, procs
 
 

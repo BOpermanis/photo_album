@@ -436,12 +436,18 @@ async function viewPhotoDetail(id) {
     datalist.innerHTML = "";
     for (const p of persons.persons)
       datalist.appendChild(el(`<option value="${esc(p.name)}"></option>`));
+    applyPhoto(photo);
+  }
+
+  // Apply a fresh photo payload (from a fetch or an SSE push) and re-render.
+  function applyPhoto(next) {
+    photo = next;
     if (!spaceLocked && photo.has_edit) space = "aligned";
     if (space === "aligned" && !photo.has_edit) space = "original";
     const src = `/media/${esc(srcName())}`;
     if (!img.src.endsWith(src)) img.src = src;
     render();
-    ensurePolling();
+    ensureStream();
   }
 
   // --- Static stage tools (built once; visibility refreshed on render) ---
@@ -612,28 +618,51 @@ async function viewPhotoDetail(id) {
   };
   window.addEventListener("resize", onResize);
 
-  // Poll while any background work (detect/align) is pending for this photo.
-  let pollTimer = null;
-  function ensurePolling() {
+  // Reactive updates: subscribe to a server-sent event stream that pushes the
+  // photo detail the instant background work (align/detect) changes state.
+  let stream = null;
+  function closeStream() {
+    if (stream) {
+      stream.close();
+      stream = null;
+    }
+  }
+  function ensureStream() {
     const pending = !photo.processed || photo.detect_pending || photo.align_pending;
-    if (!pending) {
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
+    if (!document.body.contains(view)) {
+      closeStream();
       return;
     }
-    if (pollTimer) return;
-    pollTimer = setInterval(async () => {
+    if (!pending) {
+      closeStream();
+      return;
+    }
+    if (stream) return;
+    stream = new EventSource(`/api/photos/${id}/stream`);
+    stream.onmessage = (ev) => {
       if (!document.body.contains(view)) {
-        clearInterval(pollTimer);
-        pollTimer = null;
+        closeStream();
         return;
       }
-      await reload();
-    }, 2500);
+      try {
+        applyPhoto(JSON.parse(ev.data));
+      } catch {
+        /* ignore malformed frame */
+      }
+    };
+    const stop = () => closeStream();
+    stream.addEventListener("done", stop);
+    stream.addEventListener("gone", stop);
+    // A "timeout" frame closes the long-lived stream; reopen if still pending.
+    stream.addEventListener("timeout", () => {
+      closeStream();
+      ensureStream();
+    });
+    stream.onerror = () => {
+      if (!document.body.contains(view)) closeStream();
+    };
   }
-  ensurePolling();
+  ensureStream();
 }
 
 // --------------------- Perspective correction editor ---------------------

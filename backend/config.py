@@ -14,6 +14,9 @@ PORT = 8000
 # with WORKER_PROCESSES; keep it small. Override with PHOTO_WORKERS env.
 WORKER_PROCESSES = int(os.environ.get("PHOTO_WORKERS", "2"))
 WORKER_POLL_INTERVAL = 1.0
+# A dedicated align-only worker (no detector model) keeps crops responsive even
+# when every detection worker is busy; it polls faster since align is cheap.
+INTERACTIVE_POLL_INTERVAL = 0.25
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 

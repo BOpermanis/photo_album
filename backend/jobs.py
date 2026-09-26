@@ -29,23 +29,31 @@ def enqueue(session: Session, photo_id: int, kind: str, payload: str = "") -> Jo
     return job
 
 
-def claim_next(session: Session, worker_pid: int):
+def claim_next(session: Session, worker_pid: int, kinds=None):
     """Atomically claim the next pending job for this process.
 
     A conditional UPDATE guarded by `status='pending'` guarantees that two
     worker processes can never grab the same row, even under WAL concurrency.
-    Returns a detached tuple (id, photo_id, kind, payload) or None.
+    Pass `kinds` to restrict a worker to a subset of job kinds (e.g. an
+    align-only interactive lane). Returns a detached tuple
+    (id, photo_id, kind, payload) or None.
     """
     now = time.time()
+    params = {"pid": worker_pid, "now": now}
+    kind_clause = ""
+    if kinds:
+        names = {f"k{i}": k for i, k in enumerate(kinds)}
+        params.update(names)
+        kind_clause = " AND kind IN (" + ",".join(f":{n}" for n in names) + ")"
     res = session.execute(
         text(
             "UPDATE job SET status='running', worker_pid=:pid, started_at=:now, "
             "updated_at=:now WHERE id = ("
-            "  SELECT id FROM job WHERE status='pending' "
+            "  SELECT id FROM job WHERE status='pending'" + kind_clause + " "
             "  ORDER BY priority DESC, id DESC LIMIT 1"
             ") AND status='pending'"
         ),
-        {"pid": worker_pid, "now": now},
+        params,
     )
     session.commit()
     if not res.rowcount:
