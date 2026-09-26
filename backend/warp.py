@@ -128,40 +128,78 @@ def _rotate(im: Image.Image, rotation: int) -> Image.Image:
     return im.rotate(-rotation, expand=True)
 
 
-def warp_and_save(
-    original_path, rotation: int, points_frac: List[List[float]]
-) -> Tuple[str, int, int]:
-    """Rotate then perspective-warp the original; save a new library file.
+def _rotation_matrix(w: int, h: int, rotation: int):
+    """3x3 matrix mapping original EXIF pixel coords to rotated-image coords,
+    plus the rotated (width, height). Rotation is clockwise, multiples of 90."""
+    rotation %= 360
+    if rotation == 0:
+        m = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float64)
+        return m, w, h
+    if rotation == 90:
+        m = np.array([[0, -1, h], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
+        return m, h, w
+    if rotation == 180:
+        m = np.array([[-1, 0, w], [0, -1, h], [0, 0, 1]], dtype=np.float64)
+        return m, w, h
+    # 270
+    m = np.array([[0, 1, 0], [-1, 0, w], [0, 0, 1]], dtype=np.float64)
+    return m, h, w
 
-    `points_frac` are 4 corners as fractions of the rotated image. Output
-    dimensions come from the distance between the midpoints of opposite sides,
-    so the selected shape's proportions are preserved without stretching.
-    Returns (stored_name, width, height).
-    """
-    im = _rotate(_load_rgb(original_path), rotation)
-    rw, rh = im.size
-    arr = np.asarray(im)
 
-    pts = np.array(
-        [[fx * rw, fy * rh] for fx, fy in points_frac], dtype=np.float32
-    )
-    tl, tr, br, bl = _order_corners(pts)
-
+def _output_dims(tl, tr, br, bl) -> Tuple[int, int]:
     top_mid = (tl + tr) / 2.0
     bottom_mid = (bl + br) / 2.0
     left_mid = (tl + bl) / 2.0
     right_mid = (tr + br) / 2.0
-    out_w = int(round(np.linalg.norm(right_mid - left_mid)))
-    out_h = int(round(np.linalg.norm(bottom_mid - top_mid)))
-    out_w = max(1, out_w)
-    out_h = max(1, out_h)
+    out_w = max(1, int(round(np.linalg.norm(right_mid - left_mid))))
+    out_h = max(1, int(round(np.linalg.norm(bottom_mid - top_mid))))
+    return out_w, out_h
 
+
+def build_forward_matrix(
+    original_size: Tuple[int, int], rotation: int, points_frac: List[List[float]]
+):
+    """Homography mapping original EXIF pixel coords -> aligned pixel coords.
+
+    Composes the 90-degree rotation with the perspective correction so face
+    polygons can be mapped between the two spaces without re-saving the image.
+    Returns (matrix 3x3, out_w, out_h).
+    """
+    w, h = original_size
+    rot, rw, rh = _rotation_matrix(w, h, rotation)
+    pts = np.array([[fx * rw, fy * rh] for fx, fy in points_frac], dtype=np.float32)
+    tl, tr, br, bl = _order_corners(pts)
+    out_w, out_h = _output_dims(tl, tr, br, bl)
     src = np.array([tl, tr, br, bl], dtype=np.float32)
     dst = np.array(
         [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
         dtype=np.float32,
     )
-    matrix = cv2.getPerspectiveTransform(src, dst)
+    persp = cv2.getPerspectiveTransform(src, dst).astype(np.float64)
+    matrix = persp @ rot
+    return matrix, out_w, out_h
+
+
+def map_points(matrix, pts) -> List[List[float]]:
+    """Apply a 3x3 homography to a list of [x, y] points."""
+    arr = np.asarray(pts, dtype=np.float64).reshape(-1, 1, 2)
+    out = cv2.perspectiveTransform(arr, np.asarray(matrix, dtype=np.float64))
+    return [[float(x), float(y)] for x, y in out.reshape(-1, 2)]
+
+
+def warp_and_save(
+    original_path, rotation: int, points_frac: List[List[float]]
+) -> Tuple[str, int, int, "np.ndarray"]:
+    """Rotate then perspective-warp the original; save a new library file.
+
+    `points_frac` are 4 corners as fractions of the rotated image. Output
+    dimensions come from the distance between the midpoints of opposite sides,
+    so the selected shape's proportions are preserved without stretching.
+    Returns (stored_name, width, height, forward_matrix).
+    """
+    im = _load_rgb(original_path)
+    arr = np.asarray(im)
+    matrix, out_w, out_h = build_forward_matrix(im.size, rotation, points_frac)
     warped = cv2.warpPerspective(
         arr, matrix, (out_w, out_h), flags=cv2.INTER_CUBIC
     )
@@ -169,7 +207,7 @@ def warp_and_save(
     stored_name = f"warp_{uuid.uuid4().hex[:16]}.jpg"
     dest = LIBRARY_DIR / stored_name
     Image.fromarray(warped).save(dest, "JPEG", quality=95)
-    return stored_name, out_w, out_h
+    return stored_name, out_w, out_h, matrix
 
 
 def delete_file(filename: str) -> None:

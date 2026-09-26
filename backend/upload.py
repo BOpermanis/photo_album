@@ -1,15 +1,16 @@
 import hashlib
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from PIL import Image, ImageOps
 from sqlmodel import Session, select
 
+from . import jobs
 from .config import ALLOWED_EXTENSIONS, LIBRARY_DIR
 from .db import get_session
-from .models import Photo
+from .models import Album, Photo
 
 try:
     import pillow_heif
@@ -21,11 +22,21 @@ except Exception:  # pragma: no cover - HEIC support is optional
 router = APIRouter()
 
 
+def _resolve_album_id(session: Session, album_id: Optional[int]) -> Optional[int]:
+    if album_id is not None and session.get(Album, album_id):
+        return album_id
+    # Fall back to the earliest album so every upload lands somewhere.
+    first = session.exec(select(Album).order_by(Album.id)).first()
+    return first.id if first else None
+
+
 @router.post("/api/upload")
 async def upload(
     files: List[UploadFile] = File(...),
+    album_id: Optional[int] = Form(None),
     session: Session = Depends(get_session),
 ):
+    target_album = _resolve_album_id(session, album_id)
     results = []
     for file in files:
         ext = Path(file.filename or "").suffix.lower()
@@ -59,14 +70,18 @@ async def upload(
             width = height = 0
 
         photo = Photo(
+            album_id=target_album,
             filename=stored_name,
             content_hash=content_hash,
             width=width,
             height=height,
+            original_width=width,
+            original_height=height,
         )
         session.add(photo)
         session.commit()
         session.refresh(photo)
+        jobs.enqueue(session, photo.id, "detect")
         results.append({"filename": file.filename, "status": "uploaded", "id": photo.id})
 
     return {"results": results}

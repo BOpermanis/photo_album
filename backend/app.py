@@ -1,23 +1,21 @@
+import json
 import platform
 import socket
 import subprocess
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
+import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
-import json
-
-from . import detect
-from . import recognize
-from . import warp
+from . import jobs, recognize, warp, worker
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT
-from .db import get_session, init_db
-from .models import Face, Person, Photo
+from .db import engine, get_session, init_db
+from .models import Album, Face, Job, Person, Photo
 from .upload import router as upload_router
 
 
@@ -84,9 +82,14 @@ def _print_qr() -> None:
 async def lifespan(app: FastAPI):
     init_db()
     recognize.load()
-    detect.start_worker()
+    with Session(engine) as session:
+        requeued = jobs.requeue_stale(session)
+        if requeued:
+            print(f"[jobs] requeued {requeued} stale job(s)")
+    app.state.worker_pool = worker.start_pool()
     _print_qr()
     yield
+    worker.stop_pool(getattr(app.state, "worker_pool", None))
 
 
 app = FastAPI(title="Family Photo Face-Tagging", lifespan=lifespan)
@@ -94,6 +97,41 @@ app.include_router(upload_router)
 
 
 # ----------------------------- serialization -----------------------------
+def _parse_poly(raw: str):
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def _face_embedding(face: Face):
+    if not face.embedding:
+        return None
+    return np.frombuffer(face.embedding, dtype=np.float32)
+
+
+def _forward_matrix(photo: Photo):
+    """Homography original -> aligned from the photo's transform, or None."""
+    if not photo.edit_params or not photo.original_width:
+        return None
+    params = json.loads(photo.edit_params)
+    matrix, _, _ = warp.build_forward_matrix(
+        (photo.original_width, photo.original_height),
+        params["rotation"],
+        params["points"],
+    )
+    return matrix
+
+
+def _poly_bbox(poly):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    x, y = min(xs), min(ys)
+    return x, y, max(xs) - x, max(ys) - y
+
+
 def _face_dict(session: Session, face: Face) -> dict:
     person_name = None
     if face.person_id is not None:
@@ -105,6 +143,8 @@ def _face_dict(session: Session, face: Face) -> dict:
         "y": face.y,
         "w": face.w,
         "h": face.h,
+        "poly_original": _parse_poly(face.poly_original),
+        "poly_aligned": _parse_poly(face.poly_aligned),
         "confidence": face.confidence,
         "person_id": face.person_id,
         "person_name": person_name,
@@ -114,8 +154,10 @@ def _face_dict(session: Session, face: Face) -> dict:
 def _photo_summary(session: Session, photo: Photo) -> dict:
     faces = session.exec(select(Face).where(Face.photo_id == photo.id)).all()
     untagged = sum(1 for f in faces if f.person_id is None)
+    flags = jobs.pending_flags(session, photo.id)
     return {
         "id": photo.id,
+        "album_id": photo.album_id,
         "filename": photo.filename,
         "display_filename": photo.display_filename,
         "width": photo.width,
@@ -123,6 +165,8 @@ def _photo_summary(session: Session, photo: Photo) -> dict:
         "processed": photo.processed,
         "face_count": len(faces),
         "untagged_count": untagged,
+        "detect_pending": flags["detect_pending"],
+        "align_pending": flags["align_pending"],
     }
 
 
@@ -130,22 +174,11 @@ def _attach_suggestions(
     session: Session, photo: Photo, faces: list, face_dicts: list
 ) -> None:
     """Add suggested_person_* fields to unnamed faces that match a known person."""
-    unnamed = [f for f in faces if f.person_id is None]
-    if not unnamed:
-        return
-    missing = [f for f in unnamed if not recognize.cache_has(f.id)]
-    if missing:
-        try:
-            embs = detect.get_detector().embed_photo(
-                LIBRARY_DIR / photo.display_filename, missing
-            )
-            for fid, emb in embs.items():
-                recognize.cache_set(fid, emb)
-        except Exception as exc:  # pragma: no cover - detection is best-effort
-            print(f"[recognize] embed failed for {photo.filename}: {exc}")
     by_id = {f.id: d for f, d in zip(faces, face_dicts)}
-    for f in unnamed:
-        emb = recognize.cache_get(f.id)
+    for f in faces:
+        if f.person_id is not None:
+            continue
+        emb = _face_embedding(f)
         if emb is None:
             continue
         match = recognize.query(emb)
@@ -169,8 +202,15 @@ def media(filename: str):
 
 # ------------------------------- photos -----------------------------------
 @app.get("/api/photos")
-def list_photos(filter: str = "all", session: Session = Depends(get_session)):
-    photos = session.exec(select(Photo).order_by(Photo.imported_at.desc())).all()
+def list_photos(
+    filter: str = "all",
+    album_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
+    query = select(Photo).order_by(Photo.imported_at.desc())
+    if album_id is not None:
+        query = query.where(Photo.album_id == album_id)
+    photos = session.exec(query).all()
     summaries = [_photo_summary(session, p) for p in photos]
     if filter == "untagged":
         summaries = [
@@ -187,15 +227,22 @@ def get_photo(photo_id: int, session: Session = Depends(get_session)):
     faces = session.exec(select(Face).where(Face.photo_id == photo_id)).all()
     face_dicts = [_face_dict(session, f) for f in faces]
     _attach_suggestions(session, photo, faces, face_dicts)
+    flags = jobs.pending_flags(session, photo_id)
     return {
         "id": photo.id,
+        "album_id": photo.album_id,
         "filename": photo.filename,
         "display_filename": photo.display_filename,
+        "edited_filename": photo.edited_filename,
         "width": photo.width,
         "height": photo.height,
+        "original_width": photo.original_width or photo.width,
+        "original_height": photo.original_height or photo.height,
         "processed": photo.processed,
         "description": photo.description,
         "has_edit": bool(photo.edited_filename),
+        "detect_pending": flags["detect_pending"],
+        "align_pending": flags["align_pending"],
         "faces": face_dicts,
     }
 
@@ -218,21 +265,6 @@ def update_description(
 
 
 # --------------------------- perspective correction -----------------------
-def _reset_photo_faces(session: Session, photo: Photo) -> list[int]:
-    """Drop existing detections so the worker re-processes the current image.
-
-    Returns the removed face ids; the caller must drop them from the
-    recognition index *after* committing, since that opens its own DB
-    connection and would otherwise deadlock on SQLite's write lock.
-    """
-    faces = session.exec(select(Face).where(Face.photo_id == photo.id)).all()
-    ids = [f.id for f in faces]
-    for f in faces:
-        session.delete(f)
-    photo.processed = False
-    return ids
-
-
 @app.get("/api/photos/{photo_id}/adjust")
 def adjust_info(photo_id: int, session: Session = Depends(get_session)):
     """Original image dimensions plus a best-guess quad for the corner editor."""
@@ -288,25 +320,13 @@ def warp_photo(
     if rotation not in (0, 90, 180, 270):
         raise HTTPException(status_code=400, detail="Rotation must be a multiple of 90")
 
-    try:
-        stored_name, w, h = warp.warp_and_save(
-            LIBRARY_DIR / photo.filename, rotation, body.points
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Warp failed: {exc}")
-
-    old_edited = photo.edited_filename
-    photo.edited_filename = stored_name
-    photo.width, photo.height = w, h
+    # Save the transform and let a background job build the aligned image and
+    # remap face polygons. The request returns immediately so the UI stays snappy.
     photo.edit_params = json.dumps({"rotation": rotation, "points": body.points})
-    removed = _reset_photo_faces(session, photo)
     session.add(photo)
     session.commit()
-    for fid in removed:
-        recognize.remove(fid)
-    if old_edited and old_edited != stored_name:
-        warp.delete_file(old_edited)
-    return {"id": photo.id, "display_filename": photo.display_filename}
+    jobs.enqueue(session, photo.id, "align")
+    return {"id": photo.id, "status": "queued"}
 
 
 @app.post("/api/photos/{photo_id}/warp/reset")
@@ -315,21 +335,31 @@ def reset_warp(photo_id: int, session: Session = Depends(get_session)):
     photo = session.get(Photo, photo_id)
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
-    if not photo.edited_filename:
-        return {"id": photo.id, "display_filename": photo.display_filename}
-
     old_edited = photo.edited_filename
-    with warp._load_rgb(LIBRARY_DIR / photo.filename) as im:  # noqa: SLF001
-        photo.width, photo.height = im.size
-    photo.edited_filename = ""
     photo.edit_params = ""
-    removed = _reset_photo_faces(session, photo)
+    if old_edited:
+        photo.edited_filename = ""
+        photo.width = photo.original_width or photo.width
+        photo.height = photo.original_height or photo.height
+        for f in session.exec(select(Face).where(Face.photo_id == photo_id)).all():
+            if f.poly_aligned:
+                f.poly_aligned = ""
+                session.add(f)
     session.add(photo)
     session.commit()
-    for fid in removed:
-        recognize.remove(fid)
-    warp.delete_file(old_edited)
+    if old_edited:
+        warp.delete_file(old_edited)
     return {"id": photo.id, "display_filename": photo.display_filename}
+
+
+@app.post("/api/photos/{photo_id}/rerun-detection")
+def rerun_detection(photo_id: int, session: Session = Depends(get_session)):
+    """Queue a fresh detection on the current (aligned) image."""
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    jobs.enqueue(session, photo.id, "rerun_detect")
+    return {"id": photo.id, "status": "queued"}
 
 
 # ------------------------------- faces ------------------------------------
@@ -373,21 +403,12 @@ def assign_face(
 
 def _index_reference_face(session: Session, face: Face, person_id: int) -> None:
     """Add a confirmed face's embedding to the in-memory recognition index."""
-    emb = recognize.cache_get(face.id)
-    if emb is None:
-        photo = session.get(Photo, face.photo_id)
-        if photo:
-            try:
-                embs = detect.get_detector().embed_photo(
-                    LIBRARY_DIR / photo.display_filename, [face]
-                )
-                emb = embs.get(face.id)
-                if emb is not None:
-                    recognize.cache_set(face.id, emb)
-            except Exception as exc:  # pragma: no cover - detection is best-effort
-                print(f"[recognize] embed failed for face {face.id}: {exc}")
+    emb = _face_embedding(face)
     if emb is not None:
         recognize.add(face.id, person_id, emb)
+    else:
+        # Manual boxes have no embedding until a detection run computes one.
+        print(f"[recognize] no embedding for face {face.id}; skipping index")
 
 
 @app.post("/api/faces/{face_id}/unassign")
@@ -418,6 +439,8 @@ class ManualFaceBody(BaseModel):
     y: float
     w: float
     h: float
+    # Which image the coordinates are in: "original", "aligned", or "auto".
+    space: str = "auto"
 
 
 @app.post("/api/photos/{photo_id}/faces")
@@ -427,13 +450,43 @@ def add_manual_face(
     photo = session.get(Photo, photo_id)
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
-    x = max(0.0, min(body.x, float(photo.width)))
-    y = max(0.0, min(body.y, float(photo.height)))
-    w = min(body.w, float(photo.width) - x)
-    h = min(body.h, float(photo.height) - y)
+    space = body.space
+    if space == "auto":
+        space = "aligned" if photo.edited_filename else "original"
+    aligned = space == "aligned" and bool(photo.edited_filename)
+
+    if aligned:
+        max_w, max_h = float(photo.width), float(photo.height)
+    else:
+        max_w = float(photo.original_width or photo.width)
+        max_h = float(photo.original_height or photo.height)
+    x = max(0.0, min(body.x, max_w))
+    y = max(0.0, min(body.y, max_h))
+    w = min(body.w, max_w - x)
+    h = min(body.h, max_h - y)
     if w < 1.0 or h < 1.0:
         raise HTTPException(status_code=400, detail="Box is too small")
-    face = Face(photo_id=photo_id, x=x, y=y, w=w, h=h, confidence=1.0)
+
+    rect = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+    matrix = _forward_matrix(photo)
+    if aligned:
+        poly_aligned = rect
+        poly_original = (
+            warp.map_points(np.linalg.inv(matrix), rect) if matrix is not None else rect
+        )
+        bx, by, bw, bh = _poly_bbox(poly_original)
+    else:
+        poly_original = rect
+        poly_aligned = warp.map_points(matrix, rect) if matrix is not None else None
+        bx, by, bw, bh = x, y, w, h
+
+    face = Face(
+        photo_id=photo_id,
+        x=bx, y=by, w=bw, h=bh,
+        confidence=1.0,
+        poly_original=json.dumps(poly_original),
+        poly_aligned=json.dumps(poly_aligned) if poly_aligned is not None else "",
+    )
     session.add(face)
     session.commit()
     session.refresh(face)
@@ -485,6 +538,113 @@ def person_photos(person_id: int, session: Session = Depends(get_session)):
     photos = [session.get(Photo, pid) for pid in photo_ids]
     summaries = [_photo_summary(session, p) for p in photos if p]
     return {"person": {"id": person.id, "name": person.name}, "photos": summaries}
+
+
+# ------------------------------- albums -----------------------------------
+class AlbumBody(BaseModel):
+    name: Optional[str] = None
+
+
+def _album_stats(session: Session, album_id: int) -> dict:
+    image_count = session.exec(
+        select(func.count(Photo.id)).where(Photo.album_id == album_id)
+    ).one()
+    face_count = session.exec(
+        select(func.count(Face.id))
+        .select_from(Face)
+        .join(Photo, Face.photo_id == Photo.id)
+        .where(Photo.album_id == album_id)
+    ).one()
+    identity_count = session.exec(
+        select(func.count(func.distinct(Face.person_id)))
+        .select_from(Face)
+        .join(Photo, Face.photo_id == Photo.id)
+        .where(Photo.album_id == album_id, Face.person_id.is_not(None))
+    ).one()
+    return {
+        "image_count": image_count,
+        "face_count": face_count,
+        "identity_count": identity_count,
+    }
+
+
+def _next_album_name(session: Session) -> str:
+    n = session.exec(select(func.count(Album.id))).one() + 1
+    name = f"Album_{n}"
+    while session.exec(select(Album).where(Album.name == name)).first():
+        n += 1
+        name = f"Album_{n}"
+    return name
+
+
+@app.get("/api/albums")
+def list_albums(session: Session = Depends(get_session)):
+    albums = session.exec(select(Album).order_by(Album.id)).all()
+    out = [
+        {"id": a.id, "name": a.name, **_album_stats(session, a.id)} for a in albums
+    ]
+    return {"albums": out}
+
+
+@app.post("/api/albums")
+def create_album(
+    body: Optional[AlbumBody] = None, session: Session = Depends(get_session)
+):
+    name = (body.name or "").strip() if body else ""
+    if not name:
+        name = _next_album_name(session)
+    if session.exec(select(Album).where(Album.name == name)).first():
+        raise HTTPException(status_code=400, detail="Album name already exists")
+    album = Album(name=name)
+    session.add(album)
+    session.commit()
+    session.refresh(album)
+    return {"id": album.id, "name": album.name}
+
+
+@app.patch("/api/albums/{album_id}")
+def rename_album(
+    album_id: int, body: AlbumBody, session: Session = Depends(get_session)
+):
+    album = session.get(Album, album_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+    dup = session.exec(
+        select(Album).where(Album.name == name, Album.id != album_id)
+    ).first()
+    if dup:
+        raise HTTPException(status_code=400, detail="Album name already exists")
+    album.name = name
+    session.add(album)
+    session.commit()
+    return {"id": album.id, "name": album.name}
+
+
+# ------------------------------- jobs -------------------------------------
+@app.get("/api/jobs")
+def list_jobs(session: Session = Depends(get_session)):
+    rows = session.exec(select(Job).order_by(Job.id.desc())).all()
+    out = []
+    for j in rows:
+        photo = session.get(Photo, j.photo_id)
+        out.append(
+            {
+                "id": j.id,
+                "photo_id": j.photo_id,
+                "display_filename": photo.display_filename if photo else None,
+                "kind": j.kind,
+                "status": j.status,
+                "priority": j.priority,
+                "error": j.error,
+                "created_at": j.created_at,
+                "started_at": j.started_at,
+                "updated_at": j.updated_at,
+            }
+        )
+    return {"jobs": out}
 
 
 # ------------------------------- frontend ---------------------------------

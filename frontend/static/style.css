@@ -453,3 +453,210 @@ input[type="text"] {
   display: inline-block;
   margin-bottom: 12px;
 }
+
+/* Active-album chip in the nav */
+.album-chip {
+  color: var(--text) !important;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.album-chip:hover {
+  border-color: var(--accent);
+}
+
+.toolbar-spacer {
+  flex: 1;
+}
+
+/* SVG face-polygon overlay (supports warped, non-rectangular boxes) */
+.face-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.face-overlay .facepoly {
+  fill: rgba(79, 140, 255, 0.12);
+  stroke: var(--accent);
+  stroke-width: 2px;
+  vector-effect: non-scaling-stroke;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.face-overlay .facepoly.named {
+  stroke: var(--accent-2);
+  fill: rgba(46, 204, 113, 0.12);
+}
+.face-overlay .facepoly.active {
+  stroke: #fff;
+  stroke-width: 3px;
+}
+.stage.drawing .face-overlay {
+  pointer-events: none;
+}
+
+.face-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.face-labels .facelabel {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 0.72rem;
+  padding: 2px 6px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.face-labels .facelabel.named {
+  background: rgba(46, 204, 113, 0.85);
+}
+
+/* Original / aligned space toggle */
+.space-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.space-toggle button {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: none;
+  border-radius: 0;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+}
+.space-toggle button.active {
+  background: var(--accent);
+  color: #fff;
+}
+.stage-status {
+  font-size: 0.85rem;
+}
+
+/* Albums */
+.album-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+}
+.album-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.album-card.active {
+  border-color: var(--accent);
+}
+.album-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.album-head .album-name {
+  flex: 1;
+  font-weight: 600;
+}
+.album-stats {
+  display: flex;
+  gap: 14px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.album-stats strong {
+  color: var(--text);
+}
+.album-actions {
+  display: flex;
+  gap: 8px;
+}
+.album-actions .work {
+  flex: 1;
+}
+
+/* Jobs */
+.jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.job-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  text-decoration: none;
+  color: var(--text);
+}
+.job-row:hover {
+  border-color: var(--accent);
+}
+.job-thumb {
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel-2);
+  flex-shrink: 0;
+}
+.job-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.job-main {
+  flex: 1;
+  min-width: 0;
+}
+.job-kind {
+  font-weight: 600;
+}
+.job-when {
+  font-size: 0.8rem;
+}
+.job-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.job-status {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.job-status.pending {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.job-status.running {
+  background: rgba(79, 140, 255, 0.2);
+  color: var(--accent);
+}
+.job-status.done {
+  background: rgba(46, 204, 113, 0.18);
+  color: var(--accent-2);
+}
+.job-status.failed {
+  background: rgba(255, 92, 92, 0.18);
+  color: var(--danger);
+}

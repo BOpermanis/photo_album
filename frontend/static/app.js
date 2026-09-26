@@ -40,6 +40,8 @@ function esc(s) {
 
 // --------------------------- Router ---------------------------
 const routes = [
+  [/^\/albums$/, viewAlbums],
+  [/^\/jobs$/, viewJobs],
   [/^\/upload$/, viewUpload],
   [/^\/photos$/, viewPhotos],
   [/^\/photo\/(\d+)$/, viewPhotoDetail],
@@ -48,7 +50,8 @@ const routes = [
 ];
 
 function router() {
-  const hash = location.hash.replace(/^#/, "") || "/photos";
+  const hash = location.hash.replace(/^#/, "") || "/albums";
+  updateAlbumChip();
   for (const [re, handler] of routes) {
     const m = hash.match(re);
     if (m) {
@@ -56,7 +59,7 @@ function router() {
       return;
     }
   }
-  location.hash = "#/photos";
+  location.hash = "#/albums";
 }
 
 window.addEventListener("hashchange", router);
@@ -67,13 +70,36 @@ function setView(node) {
   app.appendChild(node);
 }
 
+// --------------------------- Active album ---------------------------
+function getActiveAlbum() {
+  const id = localStorage.getItem("activeAlbumId");
+  if (!id) return null;
+  return { id: Number(id), name: localStorage.getItem("activeAlbumName") || `Album ${id}` };
+}
+
+function setActiveAlbum(id, name) {
+  localStorage.setItem("activeAlbumId", String(id));
+  localStorage.setItem("activeAlbumName", name || "");
+  updateAlbumChip();
+}
+
+function updateAlbumChip() {
+  const chip = document.getElementById("albumChip");
+  if (!chip) return;
+  const a = getActiveAlbum();
+  chip.textContent = a ? `📁 ${a.name}` : "No album";
+}
+
 // --------------------------- Upload ---------------------------
 function viewUpload() {
+  const active = getActiveAlbum();
   const view = el(`
     <div>
       <h1>Upload photos</h1>
       <div class="uploader">
-        <p class="muted">Take photos with your camera, then pick them here.<br/>Full resolution is preserved.</p>
+        <p class="muted">Uploading to <strong>${active ? esc(active.name) : "no album"}</strong>.
+          ${active ? "" : `Pick one in <a href="#/albums">Albums</a> first.`}<br/>
+          Take photos with your camera, then pick them here. Full resolution is preserved.</p>
         <input type="file" accept="image/*" multiple id="fileInput" />
         <button id="uploadBtn" disabled>Upload</button>
         <div class="upload-list" id="uploadList"></div>
@@ -95,6 +121,8 @@ function viewUpload() {
     list.innerHTML = "";
     const fd = new FormData();
     for (const f of input.files) fd.append("files", f);
+    const album = getActiveAlbum();
+    if (album) fd.append("album_id", String(album.id));
     try {
       const data = await api("/api/upload", { method: "POST", body: fd });
       for (const r of data.results) {
@@ -119,15 +147,23 @@ function viewUpload() {
 
 // --------------------------- Photos grid ---------------------------
 async function viewPhotos() {
+  const active = getActiveAlbum();
+  if (!active) {
+    location.hash = "#/albums";
+    return;
+  }
   const params = new URLSearchParams(location.hash.split("?")[1] || "");
   const filter = params.get("filter") || "all";
 
   const view = el(`
     <div>
-      <h1>Photos</h1>
+      <h1>Photos <span class="muted">— ${esc(active.name)}</span></h1>
       <div class="toolbar">
         <a href="#/photos?filter=all" class="chip ${filter === "all" ? "active" : ""}">All</a>
         <a href="#/photos?filter=untagged" class="chip ${filter === "untagged" ? "active" : ""}">Needs tagging</a>
+        <span class="toolbar-spacer"></span>
+        <a href="#/albums" class="chip">Switch album</a>
+        <a href="#/upload" class="chip">Upload</a>
       </div>
       <div id="gridWrap"></div>
     </div>
@@ -136,17 +172,20 @@ async function viewPhotos() {
 
   const wrap = view.querySelector("#gridWrap");
   try {
-    const { photos } = await getJSON(`/api/photos?filter=${filter}`);
+    const { photos } = await getJSON(
+      `/api/photos?filter=${filter}&album_id=${active.id}`
+    );
     if (!photos.length) {
       wrap.appendChild(
-        el(`<div class="empty">No photos yet. <a href="#/upload">Upload some</a>.</div>`)
+        el(`<div class="empty">No photos in this album. <a href="#/upload">Upload some</a>.</div>`)
       );
       return;
     }
     const grid = el(`<div class="grid"></div>`);
     for (const p of photos) {
       let badge = "";
-      if (!p.processed) badge = `<span class="badge">detecting…</span>`;
+      if (p.align_pending) badge = `<span class="badge">aligning…</span>`;
+      else if (!p.processed || p.detect_pending) badge = `<span class="badge">detecting…</span>`;
       else if (p.untagged_count > 0)
         badge = `<span class="badge warn">${p.untagged_count} to tag</span>`;
       else if (p.face_count > 0) badge = `<span class="badge ok">tagged</span>`;
@@ -164,6 +203,8 @@ async function viewPhotos() {
 }
 
 // --------------------------- Photo detail ---------------------------
+const SVGNS = "http://www.w3.org/2000/svg";
+
 async function viewPhotoDetail(id) {
   const view = el(`
     <div>
@@ -195,11 +236,29 @@ async function viewPhotoDetail(id) {
     return;
   }
 
-  const img = el(`<img src="/media/${esc(photo.display_filename || photo.filename)}" alt=""/>`);
-  stage.appendChild(img);
+  // Which image space we're viewing: "aligned" (perspective-corrected) or
+  // "original". Auto-follows the aligned copy once it exists unless the user
+  // explicitly toggles.
+  let space = photo.has_edit ? "aligned" : "original";
+  let spaceLocked = false;
 
-  const curW = () => photo.width || 1;
-  const curH = () => photo.height || 1;
+  const dims = () =>
+    space === "aligned"
+      ? [photo.width || 1, photo.height || 1]
+      : [photo.original_width || photo.width || 1, photo.original_height || photo.height || 1];
+  const srcName = () =>
+    space === "aligned"
+      ? photo.edited_filename || photo.display_filename || photo.filename
+      : photo.filename;
+
+  const img = el(`<img src="/media/${esc(srcName())}" alt=""/>`);
+  const overlay = document.createElementNS(SVGNS, "svg");
+  overlay.setAttribute("class", "face-overlay");
+  overlay.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  const labels = el(`<div class="face-labels"></div>`);
+  stage.appendChild(img);
+  stage.appendChild(overlay);
+  stage.appendChild(labels);
 
   // Description editor (persists across face reloads).
   const descBox = el(`
@@ -236,17 +295,40 @@ async function viewPhotoDetail(id) {
   }
   side.appendChild(datalist);
 
-  function pct(v, total) {
-    return (v / total) * 100 + "%";
+  function polyOf(f) {
+    let poly = space === "aligned" ? f.poly_aligned : f.poly_original;
+    if (!poly || !poly.length) {
+      poly =
+        f.poly_original && f.poly_original.length
+          ? f.poly_original
+          : [
+              [f.x, f.y],
+              [f.x + f.w, f.y],
+              [f.x + f.w, f.y + f.h],
+              [f.x, f.y + f.h],
+            ];
+    }
+    return poly;
   }
 
   function render() {
-    // clear boxes
-    stage.querySelectorAll(".facebox").forEach((n) => n.remove());
-    side.querySelectorAll(".face-item, .side-head, .empty").forEach((n) => n.remove());
+    const [W, H] = dims();
+    overlay.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    overlay.innerHTML = "";
+    labels.innerHTML = "";
+    side.querySelectorAll(".face-item, .side-head, .empty, .stage-note").forEach((n) => n.remove());
 
-    if (!photo.processed) {
-      side.appendChild(el(`<div class="empty">Detecting faces…<br/><span class="muted">refresh in a moment</span></div>`));
+    refreshTools();
+
+    if (photo.align_pending) {
+      side.appendChild(
+        el(`<div class="empty">Aligning image…<br/><span class="muted">boxes update when it's ready</span></div>`)
+      );
+    }
+    if (!photo.processed || photo.detect_pending) {
+      side.appendChild(
+        el(`<div class="empty">Detecting faces…<br/><span class="muted">this runs in the background</span></div>`)
+      );
       return;
     }
     if (!photo.faces.length) {
@@ -258,14 +340,20 @@ async function viewPhotoDetail(id) {
 
     photo.faces.forEach((f, i) => {
       const named = f.person_id != null;
-      const box = el(
-        `<div class="facebox ${named ? "named" : ""}" data-fid="${f.id}"
-           style="left:${pct(f.x, curW())};top:${pct(f.y, curH())};width:${pct(f.w, curW())};height:${pct(f.h, curH())}">
-           <span class="num">${i + 1}</span>
-           ${named ? `<span class="label">${esc(f.person_name)}</span>` : ""}
-         </div>`
+      const poly = polyOf(f);
+      const pointsAttr = poly.map((p) => `${p[0]},${p[1]}`).join(" ");
+      const polyEl = document.createElementNS(SVGNS, "polygon");
+      polyEl.setAttribute("points", pointsAttr);
+      polyEl.setAttribute("class", `facepoly ${named ? "named" : ""}`);
+      overlay.appendChild(polyEl);
+
+      const [W2, H2] = dims();
+      const cx = (poly.reduce((s, p) => s + p[0], 0) / poly.length / W2) * 100;
+      const cy = (poly.reduce((s, p) => s + p[1], 0) / poly.length / H2) * 100;
+      const label = el(
+        `<div class="facelabel ${named ? "named" : ""}" style="left:${cx}%;top:${cy}%">${i + 1}${named ? ": " + esc(f.person_name) : ""}</div>`
       );
-      stage.appendChild(box);
+      labels.appendChild(label);
 
       const suggested = !named && f.suggested_person_name != null;
       const item = el(`
@@ -301,10 +389,9 @@ async function viewPhotoDetail(id) {
 
       const input = item.querySelector("input");
       const highlight = (on) => {
-        box.classList.toggle("active", on);
-        if (on) box.scrollIntoView({ block: "nearest" });
+        polyEl.classList.toggle("active", on);
       };
-      box.addEventListener("click", () => {
+      polyEl.addEventListener("click", () => {
         input.focus();
         item.scrollIntoView({ behavior: "smooth", block: "center" });
       });
@@ -349,34 +436,76 @@ async function viewPhotoDetail(id) {
     datalist.innerHTML = "";
     for (const p of persons.persons)
       datalist.appendChild(el(`<option value="${esc(p.name)}"></option>`));
-    const src = `/media/${esc(photo.display_filename || photo.filename)}`;
+    if (!spaceLocked && photo.has_edit) space = "aligned";
+    if (space === "aligned" && !photo.has_edit) space = "original";
+    const src = `/media/${esc(srcName())}`;
     if (!img.src.endsWith(src)) img.src = src;
     render();
     ensurePolling();
   }
 
-  // --- Manual face box drawing ---
+  // --- Static stage tools (built once; visibility refreshed on render) ---
   const drawBtn = el(`<button class="secondary draw-toggle">+ Add face box</button>`);
   const drawHint = el(`<span class="muted draw-hint" hidden>Drag on the photo to mark a face.</span>`);
-  stageTools.appendChild(drawBtn);
-  stageTools.appendChild(drawHint);
-
-  // --- Perspective correction / crop ---
   const adjustBtn = el(`<button class="secondary">✂ Adjust / Crop</button>`);
+  const rerunBtn = el(`<button class="secondary">↻ Rerun face detection</button>`);
+  const resetBtn = el(`<button class="secondary" hidden>↩ Revert to original</button>`);
+  const spaceToggle = el(`
+    <span class="space-toggle" hidden>
+      <button data-sp="aligned">Aligned</button>
+      <button data-sp="original">Original</button>
+    </span>
+  `);
+  const statusNote = el(`<span class="muted stage-status"></span>`);
+  stageTools.appendChild(drawBtn);
   stageTools.appendChild(adjustBtn);
+  stageTools.appendChild(rerunBtn);
+  stageTools.appendChild(resetBtn);
+  stageTools.appendChild(spaceToggle);
+  stageTools.appendChild(drawHint);
+  stageTools.appendChild(statusNote);
+
   adjustBtn.addEventListener("click", () => openAdjustEditor(id, reload));
-  if (photo.has_edit) {
-    const resetBtn = el(`<button class="secondary">↩ Revert to original</button>`);
-    stageTools.appendChild(resetBtn);
-    resetBtn.addEventListener("click", async () => {
-      if (!confirm("Discard the crop and go back to the original photo?")) return;
-      try {
-        await postJSON(`/api/photos/${id}/warp/reset`, {});
-        await reload();
-      } catch (e) {
-        alert(e.message);
-      }
+  rerunBtn.addEventListener("click", async () => {
+    try {
+      await postJSON(`/api/photos/${id}/rerun-detection`, {});
+      await reload();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  resetBtn.addEventListener("click", async () => {
+    if (!confirm("Discard the crop and go back to the original photo?")) return;
+    try {
+      await postJSON(`/api/photos/${id}/warp/reset`, {});
+      spaceLocked = false;
+      space = "original";
+      await reload();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+  spaceToggle.querySelectorAll("button").forEach((b) => {
+    b.addEventListener("click", () => {
+      space = b.dataset.sp;
+      spaceLocked = true;
+      img.src = `/media/${esc(srcName())}`;
+      render();
+      syncSideHeight();
     });
+  });
+
+  function refreshTools() {
+    resetBtn.hidden = !photo.has_edit;
+    spaceToggle.hidden = !photo.has_edit;
+    spaceToggle.querySelectorAll("button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.sp === space);
+    });
+    rerunBtn.disabled = photo.detect_pending || photo.align_pending;
+    let note = "";
+    if (photo.align_pending) note = "Aligning…";
+    else if (photo.detect_pending) note = "Detecting…";
+    statusNote.textContent = note;
   }
 
   let drawMode = false;
@@ -431,12 +560,14 @@ async function viewPhotoDetail(id) {
     draft = null;
     setDrawMode(false);
     if (w < 0.01 || h < 0.01) return; // ignore accidental clicks
+    const [W, H] = dims();
     try {
       await postJSON(`/api/photos/${id}/faces`, {
-        x: left * curW(),
-        y: top * curH(),
-        w: w * curW(),
-        h: h * curH(),
+        x: left * W,
+        y: top * H,
+        w: w * W,
+        h: h * H,
+        space,
       });
       await reload();
     } catch (err) {
@@ -481,10 +612,11 @@ async function viewPhotoDetail(id) {
   };
   window.addEventListener("resize", onResize);
 
-  // Poll while detection is pending (also restarts after a re-crop).
+  // Poll while any background work (detect/align) is pending for this photo.
   let pollTimer = null;
   function ensurePolling() {
-    if (photo.processed) {
+    const pending = !photo.processed || photo.detect_pending || photo.align_pending;
+    if (!pending) {
       if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
@@ -753,4 +885,151 @@ async function viewPerson(id) {
   } catch (e) {
     wrap.appendChild(el(`<div class="empty">${esc(e.message)}</div>`));
   }
+}
+
+// --------------------------- Albums ---------------------------
+async function viewAlbums() {
+  const view = el(`
+    <div>
+      <h1>Albums</h1>
+      <div class="toolbar">
+        <button id="newAlbum">+ New album</button>
+        <span class="muted">Pick an album to work in; uploads and the photo grid are scoped to it.</span>
+      </div>
+      <div class="album-list" id="albumList"></div>
+    </div>
+  `);
+  setView(view);
+  const list = view.querySelector("#albumList");
+
+  view.querySelector("#newAlbum").addEventListener("click", async () => {
+    try {
+      await postJSON(`/api/albums`, {});
+      await load();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  async function load() {
+    list.innerHTML = "";
+    let albums;
+    try {
+      ({ albums } = await getJSON(`/api/albums`));
+    } catch (e) {
+      list.appendChild(el(`<div class="empty">${esc(e.message)}</div>`));
+      return;
+    }
+    const activeId = getActiveAlbum() ? getActiveAlbum().id : null;
+    if (!albums.length) {
+      list.appendChild(el(`<div class="empty">No albums yet. Create one to start.</div>`));
+      return;
+    }
+    for (const a of albums) {
+      const isActive = a.id === activeId;
+      const card = el(`
+        <div class="album-card ${isActive ? "active" : ""}">
+          <div class="album-head">
+            <input class="album-name" value="${esc(a.name)}" />
+            <button class="secondary save-name">Rename</button>
+          </div>
+          <div class="album-stats">
+            <span><strong>${a.image_count}</strong> images</span>
+            <span><strong>${a.face_count}</strong> faces</span>
+            <span><strong>${a.identity_count}</strong> identities</span>
+          </div>
+          <div class="album-actions">
+            <button class="work">${isActive ? "✓ Working here" : "Work in this album"}</button>
+          </div>
+        </div>
+      `);
+      const nameInput = card.querySelector(".album-name");
+      card.querySelector(".save-name").addEventListener("click", async () => {
+        try {
+          const r = await api(`/api/albums/${a.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: nameInput.value }),
+          });
+          if (getActiveAlbum() && getActiveAlbum().id === a.id)
+            setActiveAlbum(a.id, r.name);
+          await load();
+        } catch (e) {
+          alert(e.message);
+        }
+      });
+      card.querySelector(".work").addEventListener("click", () => {
+        setActiveAlbum(a.id, nameInput.value.trim() || a.name);
+        location.hash = "#/photos";
+      });
+      list.appendChild(card);
+    }
+  }
+
+  await load();
+}
+
+// --------------------------- Jobs ---------------------------
+async function viewJobs() {
+  const view = el(`
+    <div>
+      <h1>Jobs</h1>
+      <p class="muted">Background face detection &amp; alignment, newest first. Failed jobs stay listed with their error.</p>
+      <div id="jobsWrap"></div>
+    </div>
+  `);
+  setView(view);
+  const wrap = view.querySelector("#jobsWrap");
+  let timer = null;
+
+  async function load() {
+    let jobs;
+    try {
+      ({ jobs } = await getJSON(`/api/jobs`));
+    } catch (e) {
+      wrap.innerHTML = "";
+      wrap.appendChild(el(`<div class="empty">${esc(e.message)}</div>`));
+      return;
+    }
+    wrap.innerHTML = "";
+    if (!jobs.length) {
+      wrap.appendChild(el(`<div class="empty">No jobs yet.</div>`));
+      return;
+    }
+    const listEl = el(`<div class="jobs-list"></div>`);
+    let anyActive = false;
+    for (const j of jobs) {
+      if (j.status === "pending" || j.status === "running") anyActive = true;
+      const thumb = j.display_filename
+        ? `<img loading="lazy" src="/media/${esc(j.display_filename)}" alt=""/>`
+        : "";
+      const when = j.updated_at
+        ? new Date(j.updated_at * 1000).toLocaleTimeString()
+        : "";
+      const row = el(`
+        <a class="job-row" href="#/photo/${j.photo_id}">
+          <div class="job-thumb">${thumb}</div>
+          <div class="job-main">
+            <div class="job-kind">${esc(j.kind)} <span class="muted">· photo ${j.photo_id}</span></div>
+            ${j.error ? `<div class="job-error">${esc(j.error)}</div>` : `<div class="muted job-when">${when}</div>`}
+          </div>
+          <span class="job-status ${esc(j.status)}">${esc(j.status)}</span>
+        </a>
+      `);
+      listEl.appendChild(row);
+    }
+    wrap.appendChild(listEl);
+
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (anyActive) {
+      timer = setTimeout(() => {
+        if (document.body.contains(view)) load();
+      }, 2000);
+    }
+  }
+
+  await load();
 }

@@ -2,12 +2,6 @@ import threading
 
 import numpy as np
 from PIL import Image, ImageOps
-from sqlmodel import Session, select
-
-from .config import LIBRARY_DIR
-from .db import engine
-from .models import Face, Photo
-from . import recognize
 
 try:
     import pillow_heif
@@ -100,49 +94,3 @@ def get_detector() -> FaceDetector:
         if _detector is None:
             _detector = FaceDetector()
     return _detector
-
-
-def process_pending() -> None:
-    with Session(engine) as session:
-        pending = session.exec(select(Photo).where(Photo.processed == False)).all()  # noqa: E712
-        if not pending:
-            return
-        detector = get_detector()
-        for photo in pending:
-            path = LIBRARY_DIR / photo.display_filename
-            try:
-                width, height, faces, embeddings = detector.detect(path)
-            except Exception as exc:
-                print(f"[detect] failed for {photo.filename}: {exc}")
-                continue
-            photo.width, photo.height = width, height
-            new_faces = []
-            for fd, emb in zip(faces, embeddings):
-                face = Face(photo_id=photo.id, **fd)
-                session.add(face)
-                new_faces.append((face, emb))
-            photo.processed = True
-            session.add(photo)
-            session.commit()
-            for face, emb in new_faces:
-                if emb is not None:
-                    recognize.cache_set(face.id, emb)
-            print(f"[detect] {photo.filename}: {len(faces)} face(s)")
-
-
-def _worker_loop(stop_event: threading.Event, interval: float) -> None:
-    while not stop_event.is_set():
-        try:
-            process_pending()
-        except Exception as exc:  # pragma: no cover - keep worker alive
-            print(f"[detect] worker error: {exc}")
-        stop_event.wait(interval)
-
-
-def start_worker(interval: float = 2.0):
-    stop_event = threading.Event()
-    thread = threading.Thread(
-        target=_worker_loop, args=(stop_event, interval), daemon=True
-    )
-    thread.start()
-    return stop_event, thread
