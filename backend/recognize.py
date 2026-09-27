@@ -149,3 +149,25 @@ def query(emb):
             return None
         person_id = _ref[_order[ids[0]]][0]
         return {"person_id": person_id, "score": float(cos)}
+
+if __name__ == "__main__":  # run with: python -m backend.recognize
+    from .detect import get_detector
+
+    img = np.zeros((224, 224, 3), dtype=np.uint8)  # example image (BGR)
+
+    load()  # bring the confirmed reference faces into memory
+    detector = get_detector()  # InsightFace detection + recognition (embedding)
+
+    # Report which onnxruntime provider each model session actually selected.
+    for name, model in detector.app.models.items():
+        providers = model.session.get_providers()
+        on_gpu = any(("CUDA" in p or "Tensorrt" in p) for p in providers)
+        print(f"[{name}] providers={providers} gpu={on_gpu}")
+
+    # Embedding model: 512-d ArcFace feature straight from the image.
+    emb = detector.app.models["recognition"].get_feat(img)[0]
+    emb = emb / (np.linalg.norm(emb) + 1e-9)
+    print(f"embedding: dim={emb.shape[0]} norm={float(np.linalg.norm(emb)):.3f}")
+
+    # Recognition model: nearest confirmed reference face, if any.
+    print(f"match: {query(emb)}")

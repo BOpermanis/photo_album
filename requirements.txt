@@ -6,8 +6,9 @@ pillow
 pillow-heif
 numpy
 insightface
-# GPU build; auto-falls back to CPUExecutionProvider when no CUDA GPU is present.
-onnxruntime-gpu
+# GPU build; the [cuda,cudnn] extras pull the matching CUDA 13 + cuDNN 9 wheels
+# into the venv. Auto-falls back to CPUExecutionProvider when no CUDA GPU is present.
+onnxruntime-gpu[cuda,cudnn]
 opencv-python
 annoy
 qrcode

@@ -4,6 +4,8 @@ import os
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 LIBRARY_DIR = DATA_DIR / "library"
+# Cached downscaled JPEGs for grid/thumbnail views; regenerated on demand.
+THUMB_DIR = DATA_DIR / "thumbs"
 DB_PATH = DATA_DIR / "app.db"
 FRONTEND_DIR = BASE_DIR / "frontend"
 
@@ -27,4 +29,8 @@ ANNOY_N_TREES = 10
 RECOGNITION_THRESHOLD = 0.35
 ANNOY_PATH = DATA_DIR / "face_index.ann"
 
+# Upper bound on a requested thumbnail's longest side, to cap cache growth.
+THUMBNAIL_MAX_SIZE = 2000
+
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+THUMB_DIR.mkdir(parents=True, exist_ok=True)

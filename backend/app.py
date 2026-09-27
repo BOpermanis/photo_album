@@ -4,6 +4,7 @@ import socket
 import subprocess
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import quote
 
@@ -11,14 +12,22 @@ import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
 from . import export, jobs, recognize, warp, worker
-from .config import FRONTEND_DIR, LIBRARY_DIR, PORT
+from .config import FRONTEND_DIR, LIBRARY_DIR, PORT, THUMB_DIR, THUMBNAIL_MAX_SIZE
 from .db import engine, get_session, init_db
 from .models import Album, Face, Job, Person, Photo
 from .upload import router as upload_router
+
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+except Exception:  # pragma: no cover - HEIC support is optional
+    pass
 
 
 def _is_wsl() -> bool:
@@ -197,12 +206,32 @@ def _attach_suggestions(
         d["suggested_person_name"] = person.name
         d["suggested_score"] = match["score"]
 @app.get("/media/{filename}")
-def media(filename: str):
+def media(filename: str, size: Optional[int] = None):
     library = LIBRARY_DIR.resolve()
     path = (library / filename).resolve()
     if library not in path.parents or not path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
+    if size:
+        thumb = _thumbnail(path, size)
+        if thumb is not None:
+            return FileResponse(thumb, media_type="image/jpeg")
     return FileResponse(path)
+
+
+def _thumbnail(src: Path, size: int) -> Optional[Path]:
+    """Downscale src so its longest side is `size` px; cached JPEG in THUMB_DIR."""
+    size = max(1, min(size, THUMBNAIL_MAX_SIZE))
+    cache = THUMB_DIR / f"{src.name}.{size}.jpg"
+    if cache.is_file() and cache.stat().st_mtime >= src.stat().st_mtime:
+        return cache
+    try:
+        with Image.open(src) as im:
+            img = ImageOps.exif_transpose(im).convert("RGB")
+        img.thumbnail((size, size), Image.LANCZOS)
+        img.save(cache, format="JPEG", quality=85)
+    except Exception:
+        return None
+    return cache
 
 
 # ------------------------------- photos -----------------------------------

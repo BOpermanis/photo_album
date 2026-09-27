@@ -240,7 +240,7 @@ async function viewPhotos() {
       else if (p.face_count > 0) badge = `<span class="badge ok">tagged</span>`;
       else badge = `<span class="badge">no faces</span>`;
       const card = el(
-        `<div class="card">${badge}<img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}" alt=""/></div>`
+        `<div class="card">${badge}<img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}?size=200" alt=""/></div>`
       );
       card.addEventListener("click", () => (location.hash = `#/photo/${p.id}`));
       grid.appendChild(card);
@@ -969,7 +969,7 @@ async function viewPerson(id) {
     const grid = el(`<div class="grid"></div>`);
     for (const p of data.photos) {
       const card = el(
-        `<div class="card"><img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}" alt=""/></div>`
+        `<div class="card"><img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}?size=200" alt=""/></div>`
       );
       card.addEventListener("click", () => (location.hash = `#/photo/${p.id}`));
       grid.appendChild(card);
@@ -1131,7 +1131,7 @@ async function viewJobs() {
     for (const j of jobs) {
       if (j.status === "pending" || j.status === "running") anyActive = true;
       const thumb = j.display_filename
-        ? `<img loading="lazy" src="/media/${esc(j.display_filename)}" alt=""/>`
+        ? `<img loading="lazy" src="/media/${esc(j.display_filename)}?size=200" alt=""/>`
         : "";
       const when = j.updated_at
         ? new Date(j.updated_at * 1000).toLocaleTimeString()
