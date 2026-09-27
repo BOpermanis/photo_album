@@ -461,6 +461,11 @@ input[type="text"] {
   margin-bottom: 12px;
 }
 
+/* Prev/Next bar above the photo detail */
+.detail-nav .back {
+  margin-bottom: 0;
+}
+
 /* Active-album chip in the nav */
 .album-chip {
   color: var(--text) !important;
@@ -505,6 +510,15 @@ input[type="text"] {
 }
 .stage.drawing .face-overlay {
   pointer-events: none;
+}
+/* View-only toggle: hide face polygons + labels without touching data */
+.stage.no-overlay .face-overlay,
+.stage.no-overlay .face-labels {
+  display: none;
+}
+button.secondary.overlay-toggle.active {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .face-labels {

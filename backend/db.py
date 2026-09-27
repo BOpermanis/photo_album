@@ -72,6 +72,9 @@ def _run_migrations() -> None:
             conn.execute(
                 text("ALTER TABLE photo ADD COLUMN original_height INTEGER DEFAULT 0")
             )
+        if "taken_at" not in photo_cols:
+            conn.execute(text("ALTER TABLE photo ADD COLUMN taken_at TIMESTAMP"))
+        _backfill_taken_at(conn)
 
         face_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(face)"))}
         if "poly_original" not in face_cols:
@@ -140,6 +143,26 @@ def _now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _backfill_taken_at(conn) -> None:
+    """Fill taken_at for rows that lack it: EXIF capture time, else the import
+    time. Runs once per photo since it only touches NULL rows."""
+    from .config import LIBRARY_DIR
+    from .upload import extract_taken_at
+
+    rows = list(
+        conn.execute(
+            text("SELECT id, filename, imported_at FROM photo WHERE taken_at IS NULL")
+        )
+    )
+    for pid, filename, imported_at in rows:
+        taken = extract_taken_at(LIBRARY_DIR / filename)
+        value = taken.isoformat() if taken else imported_at
+        conn.execute(
+            text("UPDATE photo SET taken_at = :ts WHERE id = :pid"),
+            {"ts": value, "pid": pid},
+        )
 
 
 def get_session():

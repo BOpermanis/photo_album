@@ -34,6 +34,9 @@ class Photo(SQLModel, table=True):
     original_width: int = 0
     original_height: int = 0
     imported_at: datetime = Field(default_factory=_utcnow)
+    # EXIF capture time (DateTimeOriginal) when available, else the import time.
+    # The Photos grid orders by this, oldest first.
+    taken_at: Optional[datetime] = Field(default=None)
     processed: bool = Field(default=False)
     description: str = Field(default="")
     # Perspective-corrected copy of the original (empty = none). The original

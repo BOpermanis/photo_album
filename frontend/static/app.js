@@ -254,10 +254,65 @@ async function viewPhotos() {
 // --------------------------- Photo detail ---------------------------
 const SVGNS = "http://www.w3.org/2000/svg";
 
+async function setupNav(view, photo, id) {
+  const prevBtn = view.querySelector(".nav-prev");
+  const nextBtn = view.querySelector(".nav-next");
+  let prevId = null;
+  let nextId = null;
+
+  // Keyboard: ←/→ move Prev/Next, Esc returns to the grid. Registered up front
+  // so Esc works even before neighbours load; self-removes once the view is gone.
+  function onKey(e) {
+    if (!view.isConnected) {
+      window.removeEventListener("keydown", onKey);
+      return;
+    }
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (document.querySelector(".editor-overlay")) return; // a modal owns the keys
+    if (e.key === "ArrowLeft" && prevId != null) {
+      e.preventDefault();
+      location.hash = `#/photo/${prevId}`;
+    } else if (e.key === "ArrowRight" && nextId != null) {
+      e.preventDefault();
+      location.hash = `#/photo/${nextId}`;
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      location.hash = "#/photos";
+    }
+  }
+  window.addEventListener("keydown", onKey);
+
+  try {
+    const { photos } = await getJSON(`/api/photos?filter=all&album_id=${photo.album_id}`);
+    if (!view.isConnected) return;
+    const ids = photos.map((p) => p.id);
+    const i = ids.indexOf(Number(id));
+    if (i === -1) return;
+    prevId = i > 0 ? ids[i - 1] : null;
+    nextId = i < ids.length - 1 ? ids[i + 1] : null;
+    if (prevId != null) {
+      prevBtn.disabled = false;
+      prevBtn.addEventListener("click", () => (location.hash = `#/photo/${prevId}`));
+    }
+    if (nextId != null) {
+      nextBtn.disabled = false;
+      nextBtn.addEventListener("click", () => (location.hash = `#/photo/${nextId}`));
+    }
+  } catch {
+    /* leave Prev/Next disabled */
+  }
+}
+
 async function viewPhotoDetail(id) {
   const view = el(`
     <div>
-      <a class="back" href="#/photos">← Back to photos</a>
+      <div class="toolbar detail-nav">
+        <a class="back" href="#/photos">← Back to photos</a>
+        <span class="toolbar-spacer"></span>
+        <button class="chip nav-prev" disabled>← Prev</button>
+        <button class="chip nav-next" disabled>Next →</button>
+      </div>
       <div class="detail">
         <div class="stage-col">
           <div class="stage" id="stage"></div>
@@ -285,11 +340,17 @@ async function viewPhotoDetail(id) {
     return;
   }
 
+  // Prev/Next navigate within the photo's album, in the same order as the grid.
+  setupNav(view, photo, id);
+
   // Which image space we're viewing: "aligned" (perspective-corrected) or
   // "original". Auto-follows the aligned copy once it exists unless the user
   // explicitly toggles.
   let space = photo.has_edit ? "aligned" : "original";
   let spaceLocked = false;
+
+  // Whether the face polygons/labels are drawn over the photo (view-only).
+  let showOverlay = true;
 
   const dims = () =>
     space === "aligned"
@@ -502,6 +563,7 @@ async function viewPhotoDetail(id) {
   // --- Static stage tools (built once; visibility refreshed on render) ---
   const drawBtn = el(`<button class="secondary draw-toggle">+ Add face box</button>`);
   const drawHint = el(`<span class="muted draw-hint" hidden>Drag on the photo to mark a face.</span>`);
+  const overlayBtn = el(`<button class="secondary overlay-toggle active">Hide face boxes</button>`);
   const adjustBtn = el(`<button class="secondary">✂ Adjust / Crop</button>`);
   const rerunBtn = el(`<button class="secondary">↻ Rerun face detection</button>`);
   const resetBtn = el(`<button class="secondary" hidden>↩ Revert to original</button>`);
@@ -514,6 +576,7 @@ async function viewPhotoDetail(id) {
   `);
   const statusNote = el(`<span class="muted stage-status"></span>`);
   stageTools.appendChild(drawBtn);
+  stageTools.appendChild(overlayBtn);
   stageTools.appendChild(adjustBtn);
   stageTools.appendChild(rerunBtn);
   stageTools.appendChild(resetBtn);
@@ -521,6 +584,16 @@ async function viewPhotoDetail(id) {
   stageTools.appendChild(spaceToggle);
   stageTools.appendChild(drawHint);
   stageTools.appendChild(statusNote);
+
+  function applyOverlayVisibility() {
+    stage.classList.toggle("no-overlay", !showOverlay);
+    overlayBtn.classList.toggle("active", showOverlay);
+    overlayBtn.textContent = showOverlay ? "Hide face boxes" : "Show face boxes";
+  }
+  overlayBtn.addEventListener("click", () => {
+    showOverlay = !showOverlay;
+    applyOverlayVisibility();
+  });
 
   adjustBtn.addEventListener("click", () => openAdjustEditor(id, reload));
   rerunBtn.addEventListener("click", async () => {

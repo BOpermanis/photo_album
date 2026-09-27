@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel
@@ -241,7 +241,9 @@ def list_photos(
     album_id: Optional[int] = None,
     session: Session = Depends(get_session),
 ):
-    query = select(Photo).order_by(Photo.imported_at.desc())
+    query = select(Photo).order_by(
+        func.coalesce(Photo.taken_at, Photo.imported_at).asc(), Photo.id.asc()
+    )
     if album_id is not None:
         query = query.where(Photo.album_id == album_id)
     photos = session.exec(query).all()
@@ -813,4 +815,18 @@ def list_jobs(session: Session = Depends(get_session)):
 
 
 # ------------------------------- frontend ---------------------------------
+@app.get("/")
+def index():
+    """Serve the SPA shell, cache-busting app.js/style.css by mtime so browsers
+    pick up edits without a manual hard refresh."""
+    html = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "style.css"):
+        try:
+            version = int((FRONTEND_DIR / "static" / name).stat().st_mtime)
+        except OSError:
+            continue
+        html = html.replace(f"/static/{name}", f"/static/{name}?v={version}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
