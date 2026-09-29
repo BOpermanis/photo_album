@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi
 uvicorn[standard]
 sqlmodel
@@ -13,3 +15,7 @@ opencv-python
 annoy
 qrcode
 reportlab
+transformers<5
+torch==2.14.0+cpu
+sentencepiece
+scikit-image

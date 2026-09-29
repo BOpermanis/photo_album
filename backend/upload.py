@@ -1,6 +1,6 @@
 import hashlib
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -24,7 +24,7 @@ router = APIRouter()
 
 
 def extract_taken_at(path: Path) -> Optional[datetime]:
-    """Return the EXIF capture time (DateTimeOriginal) as a naive datetime, or None."""
+    """Return the EXIF capture time (DateTimeOriginal) as a UTC-aware datetime, or None."""
     try:
         with Image.open(path) as img:
             exif = img.getexif()
@@ -43,7 +43,10 @@ def extract_taken_at(path: Path) -> Optional[datetime]:
             raw = exif.get(306)  # DateTime (IFD0)
         if not raw:
             return None
-        return datetime.strptime(str(raw).strip(), "%Y:%m:%d %H:%M:%S")
+        # EXIF has no timezone; tag as UTC so it matches imported_at's convention.
+        return datetime.strptime(str(raw).strip(), "%Y:%m:%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
     except Exception:
         return None
 
