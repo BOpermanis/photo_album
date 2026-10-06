@@ -84,6 +84,17 @@ def _run_migrations() -> None:
         if "embedding" not in face_cols:
             conn.execute(text("ALTER TABLE face ADD COLUMN embedding BLOB"))
 
+        rel_cols = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(personrelation)"))
+        }
+        if "is_auto" not in rel_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE personrelation ADD COLUMN is_auto BOOLEAN "
+                    "DEFAULT 0"
+                )
+            )
+
         # Ensure at least one album exists and every photo belongs to one.
         default_album_id = conn.execute(
             text("SELECT id FROM album ORDER BY id LIMIT 1")

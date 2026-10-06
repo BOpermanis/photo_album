@@ -101,6 +101,7 @@ const routes = [
   [/^\/photos$/, viewPhotos],
   [/^\/photo\/(\d+)$/, viewPhotoDetail],
   [/^\/people$/, viewPeople],
+  [/^\/relations$/, viewRelations],
   [/^\/person\/(\d+)$/, viewPerson],
 ];
 
@@ -1028,6 +1029,246 @@ async function viewPeople() {
   }
 }
 
+// --------------------------- Relations ---------------------------
+// Lazily load the vendored vis-network UMD bundle only when the Relations view
+// is first opened, so the rest of the SPA never pays for it.
+let _visLoader = null;
+function loadVisNetwork() {
+  if (window.vis && window.vis.Network) return Promise.resolve();
+  if (_visLoader) return _visLoader;
+  _visLoader = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "/static/vendor/vis-network.min.js";
+    s.onload = () => resolve();
+    s.onerror = () => {
+      _visLoader = null;
+      reject(new Error("Failed to load the graph library."));
+    };
+    document.head.appendChild(s);
+  });
+  return _visLoader;
+}
+
+async function viewRelations() {
+  const view = el(`
+    <div class="relations-view">
+      <h1>Relations</h1>
+      <div class="toolbar">
+        <button class="chip active" data-toggle="family">Family / friends</button>
+        <button class="chip active" data-toggle="together">Seen together</button>
+        <button class="chip active" data-toggle="physics">Physics</button>
+        <button class="chip" data-act="fit">Fit</button>
+        <button class="chip" data-act="deduce" title="Infer relations that logically follow from the ones you entered">✨ Auto-deduce relations</button>
+        <span class="muted" data-role="deduce-status"></span>
+        <span class="editor-spacer"></span>
+        <span class="muted graph-hint">Click a person to open · click a grey link for shared photos · dashed green = auto-deduced</span>
+      </div>
+      <div id="graph" class="graph-canvas"></div>
+      <div id="sharedWrap" class="shared-photos"></div>
+    </div>
+  `);
+  setView(view);
+  const canvas = view.querySelector("#graph");
+  const sharedWrap = view.querySelector("#sharedWrap");
+
+  let data;
+  try {
+    await loadVisNetwork();
+    data = await getJSON(`/api/relations/graph`);
+  } catch (e) {
+    canvas.appendChild(el(`<div class="empty">${esc(e.message)}</div>`));
+    return;
+  }
+
+  if (!data.nodes.length) {
+    canvas.appendChild(
+      el(`<div class="empty">No people yet — tag some faces first.</div>`)
+    );
+    return;
+  }
+
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue("--accent").trim() || "#4f8cff";
+  const accent2 = css.getPropertyValue("--accent-2").trim() || "#2ecc71";
+  const muted = css.getPropertyValue("--muted").trim() || "#9aa0ac";
+  const text = css.getPropertyValue("--text").trim() || "#e6e8ec";
+  const panel = css.getPropertyValue("--panel-2").trim() || "#20242d";
+  const border = css.getPropertyValue("--border").trim() || "#2a2f3a";
+
+  const nodes = new vis.DataSet(
+    data.nodes.map((n) => ({
+      id: n.id,
+      label: n.label,
+      value: Math.max(1, n.photo_count),
+      title: n.ghost
+        ? "Unlinked name"
+        : `${n.photo_count} photo(s)`,
+      shape: "dot",
+      color: n.ghost
+        ? { background: panel, border: muted }
+        : { background: accent, border: text },
+      borderWidth: n.ghost ? 1 : 2,
+      shapeProperties: { borderDashes: n.ghost ? [4, 3] : false },
+      font: { color: text },
+    }))
+  );
+
+  const familyEdges = data.family_edges.map((e, i) => ({
+    id: `f${i}`,
+    from: e.from,
+    to: e.to,
+    label: e.label,
+    group: "family",
+    arrows: "to",
+    dashes: e.is_auto ? [6, 4] : false,
+    color: { color: accent2, highlight: accent2, opacity: e.is_auto ? 0.7 : 1 },
+    font: { color: muted, size: 11, strokeWidth: 0, align: "middle" },
+    smooth: { type: "dynamic" },
+  }));
+
+  const maxWeight = data.together_edges.reduce(
+    (m, e) => Math.max(m, e.weight),
+    1
+  );
+  const togetherEdges = data.together_edges.map((e, i) => ({
+    id: `t${i}`,
+    from: e.from,
+    to: e.to,
+    group: "together",
+    title: `${e.weight} shared photo(s)`,
+    width: 1 + (e.weight / maxWeight) * 5,
+    color: { color: muted, opacity: 0.5, highlight: accent },
+    dashes: true,
+    smooth: false,
+  }));
+
+  const edges = new vis.DataSet();
+  const shown = { family: true, together: true };
+  function syncEdges() {
+    edges.clear();
+    if (shown.family) edges.add(familyEdges);
+    if (shown.together) edges.add(togetherEdges);
+  }
+  syncEdges();
+
+  const network = new vis.Network(
+    canvas,
+    { nodes, edges },
+    {
+      nodes: {
+        scaling: { min: 8, max: 40, label: { min: 12, max: 22 } },
+      },
+      edges: { selectionWidth: 2 },
+      interaction: { hover: true, tooltipDelay: 120, multiselect: true },
+      physics: {
+        enabled: true,
+        barnesHut: { gravitationalConstant: -3000, springLength: 140 },
+        stabilization: { iterations: 200 },
+      },
+    }
+  );
+
+  network.on("click", (params) => {
+    const nodeId = params.nodes[0];
+    if (typeof nodeId === "number") {
+      location.hash = `#/person/${nodeId}`;
+      return;
+    }
+    const edgeId = params.edges[0];
+    if (edgeId != null) {
+      const edge = edges.get(edgeId);
+      if (edge && typeof edge.from === "number" && typeof edge.to === "number") {
+        showSharedPhotos(edge.from, edge.to);
+        return;
+      }
+    }
+    // Background click: clear the panel.
+    sharedWrap.innerHTML = "";
+  });
+
+  async function showSharedPhotos(aId, bId) {
+    sharedWrap.innerHTML = "";
+    const panel = el(`
+      <div class="shared-panel">
+        <div class="shared-head">
+          <strong class="shared-title">Loading shared photos…</strong>
+          <button class="chip shared-close" title="Close">✕</button>
+        </div>
+        <div class="grid shared-grid"></div>
+      </div>
+    `);
+    sharedWrap.appendChild(panel);
+    panel
+      .querySelector(".shared-close")
+      .addEventListener("click", () => (sharedWrap.innerHTML = ""));
+    const title = panel.querySelector(".shared-title");
+    const grid = panel.querySelector(".shared-grid");
+    try {
+      const res = await getJSON(
+        `/api/relations/shared?a=${aId}&b=${bId}`
+      );
+      title.textContent =
+        `${res.person_a.name} & ${res.person_b.name} — ` +
+        `${res.photos.length} shared photo(s)`;
+      if (!res.photos.length) {
+        grid.appendChild(el(`<div class="empty">No shared photos.</div>`));
+        return;
+      }
+      for (const p of res.photos) {
+        const card = el(
+          `<div class="card"><img loading="lazy" src="/media/${esc(
+            p.display_filename || p.filename
+          )}?size=200" alt=""/></div>`
+        );
+        card.addEventListener(
+          "click",
+          () => (location.hash = `#/photo/${p.id}`)
+        );
+        grid.appendChild(card);
+      }
+      panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (e) {
+      title.textContent = e.message;
+    }
+  }
+
+  view.querySelectorAll("[data-toggle]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const kind = btn.dataset.toggle;
+      const on = !btn.classList.contains("active");
+      btn.classList.toggle("active", on);
+      if (kind === "physics") {
+        network.setOptions({ physics: { enabled: on } });
+      } else {
+        shown[kind] = on;
+        syncEdges();
+      }
+    });
+  });
+
+  view
+    .querySelector('[data-act="fit"]')
+    .addEventListener("click", () => network.fit({ animation: true }));
+
+  view
+    .querySelector('[data-act="deduce"]')
+    .addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      const status = view.querySelector('[data-role="deduce-status"]');
+      btn.disabled = true;
+      status.textContent = "Deducing…";
+      try {
+        const res = await postJSON(`/api/relations/deduce`, {});
+        await viewRelations();
+        const s = document.querySelector('[data-role="deduce-status"]');
+        if (s) s.textContent = `Added ${res.created} auto relation(s)`;
+      } catch (err) {
+        status.textContent = err.message;
+        btn.disabled = false;
+      }
+    });
+}
+
 async function viewPerson(id) {
   const view = el(`
     <div>
@@ -1163,8 +1404,24 @@ async function viewPerson(id) {
     form.appendChild(profSec.box);
 
     const relSec = section("Relations", "rel");
-    for (const r of detail.relations) relSec.list.appendChild(relRow(r));
+    const manualRels = detail.relations.filter((r) => !r.is_auto);
+    const autoRels = detail.relations.filter((r) => r.is_auto);
+    for (const r of manualRels) relSec.list.appendChild(relRow(r));
     relSec.add.addEventListener("click", () => relSec.list.appendChild(relRow({})));
+    if (autoRels.length) {
+      const auto = el(
+        `<div class="auto-rels"><span class="muted">Auto-deduced:</span></div>`
+      );
+      for (const r of autoRels) {
+        const label =
+          r.kind === "custom" ? r.custom_label || "related" : r.kind;
+        const tgt = r.related_person_name || r.related_name_raw || "?";
+        auto.appendChild(
+          el(`<span class="auto-chip">${esc(label)} of ${esc(tgt)}</span>`)
+        );
+      }
+      relSec.box.appendChild(auto);
+    }
     form.appendChild(relSec.box);
 
     form.appendChild(

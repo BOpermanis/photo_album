@@ -16,7 +16,7 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
-from . import export, jobs, person_parse, recognize, warp, worker
+from . import export, jobs, person_parse, recognize, relations, warp, worker
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT, THUMB_DIR, THUMBNAIL_MAX_SIZE
 from .db import engine, get_session, init_db
 from .models import (
@@ -721,6 +721,7 @@ def _person_detail(session: Session, person: Person) -> dict:
             "kind": r.kind,
             "custom_label": r.custom_label,
             "note": r.note,
+            "is_auto": r.is_auto,
         })
     photo_count = session.exec(
         select(func.count(func.distinct(Face.photo_id))).where(
@@ -808,7 +809,10 @@ def update_person(
     ).all():
         session.delete(row)
     for row in session.exec(
-        select(PersonRelation).where(PersonRelation.person_id == person_id)
+        select(PersonRelation).where(
+            PersonRelation.person_id == person_id,
+            PersonRelation.is_auto == False,  # noqa: E712 - preserve auto rows
+        )
     ).all():
         session.delete(row)
     session.commit()
@@ -871,6 +875,157 @@ def person_photos(person_id: int, session: Session = Depends(get_session)):
         "person": {"id": person.id, "name": person.display_name},
         "photos": summaries,
     }
+
+
+# ------------------------------- relations --------------------------------
+def _relation_label(r: PersonRelation) -> str:
+    if r.kind == "custom":
+        return r.custom_label.strip() or "related"
+    return r.kind
+
+
+@app.get("/api/relations/graph")
+def relations_graph(session: Session = Depends(get_session)):
+    """Graph of every person (nodes) linked by explicit family/friend relations
+    and by co-appearance in the same photo. Consumed by the Relations view."""
+    persons = session.exec(select(Person).order_by(Person.display_name)).all()
+    nodes = []
+    for p in persons:
+        photo_count = session.exec(
+            select(func.count(func.distinct(Face.photo_id))).where(
+                Face.person_id == p.id
+            )
+        ).one()
+        nodes.append(
+            {
+                "id": p.id,
+                "label": p.display_name or f"Person {p.id}",
+                "photo_count": photo_count,
+                "ghost": False,
+            }
+        )
+
+    # Explicit, directed family/friend relations. Unresolved targets (a raw name
+    # with no linked person) become dashed "ghost" nodes so no relation is lost.
+    family_edges = []
+    ghost_ids = {}
+    for r in session.exec(select(PersonRelation)).all():
+        target = r.related_person_id
+        if target is None:
+            raw = r.related_name_raw.strip()
+            if not raw:
+                continue
+            key = f"raw:{raw.lower()}"
+            if key not in ghost_ids:
+                ghost_ids[key] = raw
+                nodes.append(
+                    {"id": key, "label": raw, "photo_count": 0, "ghost": True}
+                )
+            target = key
+        family_edges.append(
+            {
+                "from": r.person_id,
+                "to": target,
+                "label": _relation_label(r),
+                "is_auto": r.is_auto,
+            }
+        )
+
+    # Undirected co-occurrence: people whose faces share a photo, weighted by the
+    # number of shared photos.
+    rows = session.exec(
+        select(Face.photo_id, Face.person_id).where(Face.person_id.is_not(None))
+    ).all()
+    by_photo: dict[int, set] = {}
+    for photo_id, person_id in rows:
+        by_photo.setdefault(photo_id, set()).add(person_id)
+    pair_counts: dict[tuple, int] = {}
+    for people in by_photo.values():
+        ordered = sorted(people)
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                pair = (ordered[i], ordered[j])
+                pair_counts[pair] = pair_counts.get(pair, 0) + 1
+    together_edges = [
+        {"from": a, "to": b, "weight": n} for (a, b), n in pair_counts.items()
+    ]
+
+    return {
+        "nodes": nodes,
+        "family_edges": family_edges,
+        "together_edges": together_edges,
+    }
+
+
+@app.get("/api/relations/shared")
+def relations_shared(
+    a: int, b: int, session: Session = Depends(get_session)
+):
+    """Photos in which persons ``a`` and ``b`` both have a tagged face."""
+    person_a = session.get(Person, a)
+    person_b = session.get(Person, b)
+    if not person_a or not person_b:
+        raise HTTPException(status_code=404, detail="Person not found")
+    ids_a = set(
+        session.exec(
+            select(Face.photo_id).where(Face.person_id == a).distinct()
+        ).all()
+    )
+    ids_b = set(
+        session.exec(
+            select(Face.photo_id).where(Face.person_id == b).distinct()
+        ).all()
+    )
+    shared = ids_a & ids_b
+    photos = [session.get(Photo, pid) for pid in shared]
+    photos = [p for p in photos if p]
+    photos.sort(key=lambda p: (p.taken_at or p.imported_at))
+    return {
+        "person_a": {"id": person_a.id, "name": person_a.display_name},
+        "person_b": {"id": person_b.id, "name": person_b.display_name},
+        "photos": [_photo_summary(session, p) for p in photos],
+    }
+
+
+@app.post("/api/relations/deduce")
+def relations_deduce(session: Session = Depends(get_session)):
+    """Regenerate all transitively deducible relations. Previous auto rows are
+    discarded and recomputed from the user-entered (manual) relations."""
+    for row in session.exec(
+        select(PersonRelation).where(
+            PersonRelation.is_auto == True  # noqa: E712
+        )
+    ).all():
+        session.delete(row)
+    session.commit()
+
+    manual = session.exec(
+        select(PersonRelation).where(
+            PersonRelation.is_auto == False,  # noqa: E712
+            PersonRelation.related_person_id.is_not(None),
+        )
+    ).all()
+    triples = [(r.person_id, r.related_person_id, r.kind) for r in manual]
+
+    # Triples that already exist as manual relations must not be duplicated.
+    existing = {(r.person_id, r.related_person_id, r.kind) for r in manual}
+
+    created = 0
+    for person_id, related_id, kind in relations.deduce(triples):
+        if (person_id, related_id, kind) in existing:
+            continue
+        existing.add((person_id, related_id, kind))
+        session.add(
+            PersonRelation(
+                person_id=person_id,
+                related_person_id=related_id,
+                kind=kind,
+                is_auto=True,
+            )
+        )
+        created += 1
+    session.commit()
+    return {"created": created}
 
 
 # ------------------------------- albums -----------------------------------
