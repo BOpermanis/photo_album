@@ -80,12 +80,12 @@ def _image_reader(img: Image.Image) -> ImageReader:
 def _people_in_photo(session: Session, photo_id: int) -> List[str]:
     return list(
         session.exec(
-            select(Person.name)
+            select(Person.display_name)
             .select_from(Face)
             .join(Person, Face.person_id == Person.id)
             .where(Face.photo_id == photo_id)
             .distinct()
-            .order_by(Person.name)
+            .order_by(Person.display_name)
         ).all()
     )
 

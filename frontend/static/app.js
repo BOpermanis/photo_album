@@ -22,6 +22,12 @@ const postJSON = (p, body) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   });
+const putJSON = (p, body) =>
+  api(p, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
 const del = (p) => api(p, { method: "DELETE" });
 
 function el(html) {
@@ -1027,20 +1033,219 @@ async function viewPerson(id) {
     <div>
       <a class="back" href="#/people">← Back to people</a>
       <h1 id="pname">Person</h1>
+      <div id="editorWrap"></div>
+      <h2 class="section-title">Photos</h2>
       <div id="gridWrap"></div>
     </div>
   `);
   setView(view);
+  const editorWrap = view.querySelector("#editorWrap");
   const wrap = view.querySelector("#gridWrap");
+
+  let detail, persons, photoData;
   try {
-    const data = await getJSON(`/api/persons/${id}/photos`);
-    view.querySelector("#pname").textContent = data.person.name;
-    if (!data.photos.length) {
+    [detail, persons, photoData] = await Promise.all([
+      getJSON(`/api/persons/${id}`),
+      getJSON(`/api/persons`),
+      getJSON(`/api/persons/${id}/photos`),
+    ]);
+  } catch (e) {
+    editorWrap.appendChild(el(`<div class="empty">${esc(e.message)}</div>`));
+    return;
+  }
+
+  const others = persons.persons.filter((p) => p.id !== detail.id);
+  const presets = detail.relation_presets || [];
+
+  setName();
+  renderEditor();
+  renderPhotos();
+
+  function setName() {
+    view.querySelector("#pname").textContent = detail.display_name || "(unnamed)";
+  }
+
+  function section(title, cls) {
+    const box = el(`<fieldset class="person-section">
+      <legend>${esc(title)}</legend>
+      <div class="rows ${cls}-rows"></div>
+      <button class="secondary add-row" type="button">+ Add</button>
+    </fieldset>`);
+    return {
+      box,
+      list: box.querySelector(".rows"),
+      add: box.querySelector(".add-row"),
+    };
+  }
+
+  function removeBtn() {
+    const b = el(
+      `<button class="danger icon-btn" type="button" title="Remove">✕</button>`
+    );
+    b.addEventListener("click", () => b.closest(".erow").remove());
+    return b;
+  }
+
+  function nameRow(n) {
+    const row = el(`<div class="erow name-row">
+      <input class="v" type="text" placeholder="name" value="${esc(n.value || "")}" />
+      <select class="k">
+        <option value="surname">surname</option>
+        <option value="nickname">nickname</option>
+        <option value="maiden">maiden</option>
+      </select>
+    </div>`);
+    row.querySelector(".k").value = n.kind || "surname";
+    row.appendChild(removeBtn());
+    return row;
+  }
+
+  function profRow(p) {
+    const row = el(`<div class="erow prof-row">
+      <input class="title" type="text" placeholder="profession" value="${esc(p.title || "")}" />
+      <input class="place" type="text" placeholder="place" value="${esc(p.place || "")}" />
+      <input class="sy" type="number" placeholder="from" value="${p.start_year ?? ""}" />
+      <input class="ey" type="number" placeholder="to" value="${p.end_year ?? ""}" />
+    </div>`);
+    row.appendChild(removeBtn());
+    return row;
+  }
+
+  function relRow(r) {
+    const opts = presets
+      .map((k) => `<option value="${esc(k)}">${esc(k)}</option>`)
+      .join("");
+    const peopleOpts = others
+      .map((p) => `<option value="${p.id}">${esc(p.name)}</option>`)
+      .join("");
+    const row = el(`<div class="erow rel-row">
+      <select class="kind"><option value="custom">custom…</option>${opts}</select>
+      <input class="custom" type="text" placeholder="relation" value="${esc(r.custom_label || "")}" />
+      <span class="relword">of</span>
+      <select class="target"><option value="">— not linked —</option>${peopleOpts}</select>
+      <input class="raw" type="text" placeholder="name (if unlinked)" value="${esc(r.related_name_raw || "")}" />
+    </div>`);
+    const kindSel = row.querySelector(".kind");
+    kindSel.value = presets.includes(r.kind) ? r.kind : "custom";
+    const customInput = row.querySelector(".custom");
+    const toggleCustom = () => {
+      customInput.style.display = kindSel.value === "custom" ? "" : "none";
+    };
+    kindSel.addEventListener("change", toggleCustom);
+    toggleCustom();
+    if (r.related_person_id != null)
+      row.querySelector(".target").value = String(r.related_person_id);
+    row.appendChild(removeBtn());
+    return row;
+  }
+
+  function renderEditor() {
+    editorWrap.innerHTML = "";
+    const form = el(`<div class="person-editor"></div>`);
+
+    form.appendChild(
+      el(`<label class="field"><span>Given name</span>
+        <input id="givenName" type="text" value="${esc(detail.given_name)}" /></label>`)
+    );
+
+    const namesSec = section("Surnames & nicknames", "name");
+    for (const n of detail.names) namesSec.list.appendChild(nameRow(n));
+    namesSec.add.addEventListener("click", () =>
+      namesSec.list.appendChild(nameRow({}))
+    );
+    form.appendChild(namesSec.box);
+
+    const profSec = section("Professions", "prof");
+    for (const p of detail.professions) profSec.list.appendChild(profRow(p));
+    profSec.add.addEventListener("click", () =>
+      profSec.list.appendChild(profRow({}))
+    );
+    form.appendChild(profSec.box);
+
+    const relSec = section("Relations", "rel");
+    for (const r of detail.relations) relSec.list.appendChild(relRow(r));
+    relSec.add.addEventListener("click", () => relSec.list.appendChild(relRow({})));
+    form.appendChild(relSec.box);
+
+    form.appendChild(
+      el(`<label class="field"><span>Notes</span>
+        <textarea id="notes" rows="2">${esc(detail.notes)}</textarea></label>`)
+    );
+
+    const bar = el(`<div class="editor-tools">
+      <span class="muted" id="saveStatus"></span>
+      <span class="editor-spacer"></span>
+      <button class="primary" id="saveBtn">Save changes</button></div>`);
+    bar.querySelector("#saveBtn").addEventListener("click", save);
+    form.appendChild(bar);
+
+    editorWrap.appendChild(form);
+  }
+
+  function intOrNull(v) {
+    v = String(v).trim();
+    if (!v) return null;
+    const n = parseInt(v, 10);
+    return Number.isNaN(n) ? null : n;
+  }
+
+  async function save() {
+    const body = {
+      given_name: view.querySelector("#givenName").value,
+      notes: view.querySelector("#notes").value,
+      names: [...editorWrap.querySelectorAll(".name-row")]
+        .map((r) => ({
+          value: r.querySelector(".v").value,
+          kind: r.querySelector(".k").value,
+        }))
+        .filter((n) => n.value.trim()),
+      professions: [...editorWrap.querySelectorAll(".prof-row")]
+        .map((r) => ({
+          title: r.querySelector(".title").value,
+          place: r.querySelector(".place").value,
+          start_year: intOrNull(r.querySelector(".sy").value),
+          end_year: intOrNull(r.querySelector(".ey").value),
+        }))
+        .filter((p) => p.title.trim()),
+      relations: [...editorWrap.querySelectorAll(".rel-row")]
+        .map((r) => {
+          const kind = r.querySelector(".kind").value;
+          const tid = r.querySelector(".target").value;
+          return {
+            kind,
+            custom_label:
+              kind === "custom" ? r.querySelector(".custom").value : "",
+            related_person_id: tid ? Number(tid) : null,
+            related_name_raw: r.querySelector(".raw").value,
+          };
+        })
+        .filter(
+          (r) =>
+            (r.kind && r.kind !== "custom") ||
+            r.custom_label.trim() ||
+            r.related_person_id ||
+            r.related_name_raw.trim()
+        ),
+    };
+    const status = view.querySelector("#saveStatus");
+    status.textContent = "Saving…";
+    try {
+      detail = await putJSON(`/api/persons/${id}`, body);
+      setName();
+      renderEditor();
+      view.querySelector("#saveStatus").textContent = "Saved ✓";
+    } catch (e) {
+      status.textContent = "Error: " + e.message;
+    }
+  }
+
+  function renderPhotos() {
+    if (!photoData.photos.length) {
       wrap.appendChild(el(`<div class="empty">No photos.</div>`));
       return;
     }
     const grid = el(`<div class="grid"></div>`);
-    for (const p of data.photos) {
+    for (const p of photoData.photos) {
       const card = el(
         `<div class="card"><img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}?size=200" alt=""/></div>`
       );
@@ -1048,8 +1253,6 @@ async function viewPerson(id) {
       grid.appendChild(card);
     }
     wrap.appendChild(grid);
-  } catch (e) {
-    wrap.appendChild(el(`<div class="empty">${esc(e.message)}</div>`));
   }
 }
 

@@ -685,3 +685,105 @@ button.secondary.overlay-toggle.active {
   background: rgba(255, 92, 92, 0.18);
   color: var(--danger);
 }
+
+/* --- Person editor --- */
+.section-title {
+  margin: 28px 0 10px;
+  font-size: 1.1rem;
+}
+
+.person-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 760px;
+}
+
+.person-editor .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.person-editor .field > span {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.person-editor textarea {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 0.95rem;
+  width: 100%;
+  resize: vertical;
+}
+
+.person-section {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 0;
+}
+
+.person-section legend {
+  color: var(--muted);
+  font-size: 0.9rem;
+  padding: 0 6px;
+}
+
+.person-section .rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.erow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.erow input[type="text"],
+.erow input[type="number"],
+.erow select {
+  width: auto;
+  flex: 1 1 120px;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.92rem;
+}
+
+.erow input.sy,
+.erow input.ey {
+  flex: 0 0 80px;
+}
+
+.erow select.k,
+.erow select.kind {
+  flex: 0 0 120px;
+}
+
+.erow .relword {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.icon-btn {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  line-height: 1;
+}
+
+.add-row {
+  font-size: 0.88rem;
+  padding: 6px 12px;
+}

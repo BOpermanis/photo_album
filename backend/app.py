@@ -16,10 +16,19 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
-from . import export, jobs, recognize, warp, worker
+from . import export, jobs, person_parse, recognize, warp, worker
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT, THUMB_DIR, THUMBNAIL_MAX_SIZE
 from .db import engine, get_session, init_db
-from .models import Album, Face, Job, Person, Photo
+from .models import (
+    Album,
+    Face,
+    Job,
+    Person,
+    PersonName,
+    PersonProfession,
+    PersonRelation,
+    Photo,
+)
 from .upload import router as upload_router
 
 try:
@@ -150,7 +159,7 @@ def _face_dict(session: Session, face: Face) -> dict:
     person_name = None
     if face.person_id is not None:
         person = session.get(Person, face.person_id)
-        person_name = person.name if person else None
+        person_name = person.display_name if person else None
     return {
         "id": face.id,
         "x": face.x,
@@ -203,7 +212,7 @@ def _attach_suggestions(
             continue
         d = by_id[f.id]
         d["suggested_person_id"] = match["person_id"]
-        d["suggested_person_name"] = person.name
+        d["suggested_person_name"] = person.display_name
         d["suggested_score"] = match["score"]
 @app.get("/media/{filename}")
 def media(filename: str, size: Optional[int] = None):
@@ -511,12 +520,11 @@ def assign_face(
         name = body.name.strip()
         if not name:
             raise HTTPException(status_code=400, detail="Name cannot be empty")
-        person = session.exec(select(Person).where(Person.name == name)).first()
+        person = session.exec(
+            select(Person).where(Person.display_name == name)
+        ).first()
         if not person:
-            person = Person(name=name)
-            session.add(person)
-            session.commit()
-            session.refresh(person)
+            person = _create_person_from_text(session, name)
     else:
         raise HTTPException(status_code=400, detail="Provide name or person_id")
 
@@ -624,9 +632,126 @@ class PersonBody(BaseModel):
     name: str
 
 
+class NameItem(BaseModel):
+    value: str
+    kind: str = "surname"  # surname | nickname | maiden
+
+
+class ProfessionItem(BaseModel):
+    title: str
+    place: str = ""
+    start_year: Optional[int] = None
+    end_year: Optional[int] = None
+    note: str = ""
+
+
+class RelationItem(BaseModel):
+    related_person_id: Optional[int] = None
+    related_name_raw: str = ""
+    kind: str = "custom"  # a RELATION_PRESETS key or "custom"
+    custom_label: str = ""
+    note: str = ""
+
+
+class PersonUpdate(BaseModel):
+    given_name: str = ""
+    notes: str = ""
+    names: List[NameItem] = []
+    professions: List[ProfessionItem] = []
+    relations: List[RelationItem] = []
+
+
+def _recompute_display(session: Session, person: Person) -> None:
+    names = session.exec(
+        select(PersonName)
+        .where(PersonName.person_id == person.id)
+        .order_by(PersonName.sort)
+    ).all()
+    pairs = [(n.value, n.kind) for n in names]
+    person.display_name = person_parse.compute_display(
+        person.given_name, pairs, person.raw_name
+    )
+    session.add(person)
+
+
+def _create_person_from_text(session: Session, text: str) -> Person:
+    """Create a Person from a typed name, splitting it into given + surnames."""
+    parsed = person_parse.parse_name(text)
+    person = Person(given_name=parsed["given"], raw_name=text.strip())
+    session.add(person)
+    session.commit()
+    session.refresh(person)
+    for i, (value, kind) in enumerate(parsed["surnames"]):
+        session.add(
+            PersonName(
+                person_id=person.id, value=value, kind=kind,
+                is_primary=(i == 0), sort=i,
+            )
+        )
+    session.commit()
+    _recompute_display(session, person)
+    session.commit()
+    session.refresh(person)
+    return person
+
+
+def _person_detail(session: Session, person: Person) -> dict:
+    names = session.exec(
+        select(PersonName)
+        .where(PersonName.person_id == person.id)
+        .order_by(PersonName.sort)
+    ).all()
+    profs = session.exec(
+        select(PersonProfession).where(PersonProfession.person_id == person.id)
+    ).all()
+    rels = session.exec(
+        select(PersonRelation).where(PersonRelation.person_id == person.id)
+    ).all()
+    rel_out = []
+    for r in rels:
+        target_name = None
+        if r.related_person_id is not None:
+            target = session.get(Person, r.related_person_id)
+            target_name = target.display_name if target else None
+        rel_out.append({
+            "id": r.id,
+            "related_person_id": r.related_person_id,
+            "related_person_name": target_name,
+            "related_name_raw": r.related_name_raw,
+            "kind": r.kind,
+            "custom_label": r.custom_label,
+            "note": r.note,
+        })
+    photo_count = session.exec(
+        select(func.count(func.distinct(Face.photo_id))).where(
+            Face.person_id == person.id
+        )
+    ).one()
+    return {
+        "id": person.id,
+        "display_name": person.display_name,
+        "given_name": person.given_name,
+        "raw_name": person.raw_name,
+        "notes": person.notes,
+        "photo_count": photo_count,
+        "names": [
+            {"id": n.id, "value": n.value, "kind": n.kind} for n in names
+        ],
+        "professions": [
+            {
+                "id": p.id, "title": p.title, "place": p.place,
+                "start_year": p.start_year, "end_year": p.end_year, "note": p.note,
+            }
+            for p in profs
+        ],
+        "relations": rel_out,
+        "relation_presets": person_parse.RELATION_PRESETS,
+    }
+
+
 @app.get("/api/persons")
 def list_persons(session: Session = Depends(get_session)):
-    persons = session.exec(select(Person).order_by(Person.name)).all()
+    persons = session.exec(select(Person).order_by(Person.display_name)).all()
     out = []
     for p in persons:
         count = session.exec(
@@ -634,7 +759,7 @@ def list_persons(session: Session = Depends(get_session)):
                 Face.person_id == p.id
             )
         ).one()
-        out.append({"id": p.id, "name": p.name, "photo_count": count})
+        out.append({"id": p.id, "name": p.display_name, "photo_count": count})
     return {"persons": out}
 
 
@@ -643,14 +768,93 @@ def create_person(body: PersonBody, session: Session = Depends(get_session)):
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name cannot be empty")
-    existing = session.exec(select(Person).where(Person.name == name)).first()
+    existing = session.exec(
+        select(Person).where(Person.display_name == name)
+    ).first()
     if existing:
-        return {"id": existing.id, "name": existing.name}
-    person = Person(name=name)
+        return {"id": existing.id, "name": existing.display_name}
+    person = _create_person_from_text(session, name)
+    return {"id": person.id, "name": person.display_name}
+
+
+@app.get("/api/persons/{person_id}")
+def get_person(person_id: int, session: Session = Depends(get_session)):
+    person = session.get(Person, person_id)
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return _person_detail(session, person)
+
+
+@app.put("/api/persons/{person_id}")
+def update_person(
+    person_id: int, body: PersonUpdate, session: Session = Depends(get_session)
+):
+    """Full-replace the structured fields of a person (names, professions,
+    relations) and recompute the display name."""
+    person = session.get(Person, person_id)
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+
+    person.given_name = body.given_name.strip()
+    person.notes = body.notes
     session.add(person)
+
+    for row in session.exec(
+        select(PersonName).where(PersonName.person_id == person_id)
+    ).all():
+        session.delete(row)
+    for row in session.exec(
+        select(PersonProfession).where(PersonProfession.person_id == person_id)
+    ).all():
+        session.delete(row)
+    for row in session.exec(
+        select(PersonRelation).where(PersonRelation.person_id == person_id)
+    ).all():
+        session.delete(row)
+    session.commit()
+
+    for i, n in enumerate(body.names):
+        value = n.value.strip()
+        if not value:
+            continue
+        kind = n.kind if n.kind in ("surname", "nickname", "maiden") else "surname"
+        session.add(
+            PersonName(
+                person_id=person_id, value=value, kind=kind,
+                is_primary=(i == 0), sort=i,
+            )
+        )
+    for p in body.professions:
+        title = p.title.strip()
+        if not title:
+            continue
+        session.add(
+            PersonProfession(
+                person_id=person_id, title=title, place=p.place.strip(),
+                start_year=p.start_year, end_year=p.end_year, note=p.note.strip(),
+            )
+        )
+    for r in body.relations:
+        kind = r.kind if r.kind in person_parse.RELATION_PRESETS else "custom"
+        target_id = r.related_person_id
+        if target_id is not None and not session.get(Person, target_id):
+            target_id = None
+        session.add(
+            PersonRelation(
+                person_id=person_id,
+                related_person_id=target_id,
+                related_name_raw=r.related_name_raw.strip(),
+                kind=kind,
+                custom_label=r.custom_label.strip(),
+                note=r.note.strip(),
+            )
+        )
+    session.commit()
+
+    _recompute_display(session, person)
     session.commit()
     session.refresh(person)
-    return {"id": person.id, "name": person.name}
+    return _person_detail(session, person)
 
 
 @app.get("/api/persons/{person_id}/photos")
@@ -663,7 +867,10 @@ def person_photos(person_id: int, session: Session = Depends(get_session)):
     ).all()
     photos = [session.get(Photo, pid) for pid in photo_ids]
     summaries = [_photo_summary(session, p) for p in photos if p]
-    return {"person": {"id": person.id, "name": person.name}, "photos": summaries}
+    return {
+        "person": {"id": person.id, "name": person.display_name},
+        "photos": summaries,
+    }
 
 
 # ------------------------------- albums -----------------------------------

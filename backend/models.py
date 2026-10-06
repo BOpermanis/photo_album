@@ -18,8 +18,52 @@ class Album(SQLModel, table=True):
 
 class Person(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    name: str = Field(index=True, unique=True)
+    # First name(s). May be empty for occupation/relation-only placeholders.
+    given_name: str = Field(default="")
+    # Denormalized label recomputed from the structured fields on every write;
+    # this is what the UI, recognition suggestions, and PDF export render.
+    display_name: str = Field(default="", index=True)
+    # The original free-text name this person was migrated from (provenance).
+    raw_name: str = Field(default="")
+    notes: str = Field(default="")
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class PersonName(SQLModel, table=True):
+    # A surname/nickname/maiden name; a person may have several.
+    id: Optional[int] = Field(default=None, primary_key=True)
+    person_id: int = Field(foreign_key="person.id", index=True)
+    value: str
+    kind: str = Field(default="surname")  # surname | nickname | maiden
+    is_primary: bool = Field(default=False)
+    sort: int = Field(default=0)
+
+
+class PersonProfession(SQLModel, table=True):
+    # A profession held over an optional (year-granularity) time interval.
+    id: Optional[int] = Field(default=None, primary_key=True)
+    person_id: int = Field(foreign_key="person.id", index=True)
+    title: str
+    place: str = Field(default="")
+    start_year: Optional[int] = Field(default=None)
+    end_year: Optional[int] = Field(default=None)
+    note: str = Field(default="")
+
+
+class PersonRelation(SQLModel, table=True):
+    # Directed: "person_id is <kind> of related_person_id". The inverse is
+    # derived for display only. related_name_raw holds an unresolved target.
+    id: Optional[int] = Field(default=None, primary_key=True)
+    person_id: int = Field(foreign_key="person.id", index=True)
+    related_person_id: Optional[int] = Field(
+        default=None, foreign_key="person.id", index=True
+    )
+    related_name_raw: str = Field(default="")
+    # A preset key (son, daughter, father, mother, husband, wife, brother,
+    # sister, grandfather, grandmother, friend) or the sentinel "custom".
+    kind: str = Field(default="custom")
+    custom_label: str = Field(default="")
+    note: str = Field(default="")
 
 
 class Photo(SQLModel, table=True):

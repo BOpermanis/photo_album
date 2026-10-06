@@ -38,6 +38,10 @@ powershell -ExecutionPolicy Bypass -File \\wsl$\<distro>\home\bruno\repos\photo_
 Replace `<distro>` with your distro name (check with `wsl -l`). The script forwards
 port 8000 to WSL, opens the firewall, and prints the URL to open on your phone.
 
+```powershell
+powershell -ExecutionPolicy Bypass -File \\wsl$\Ubuntu\home\bruno\repos\photo_album\scripts\wsl-forward.ps1
+```
+
 > The WSL IP changes on reboot — re-run the script after restarting your PC or WSL.
 
 ## Use it from your phone
