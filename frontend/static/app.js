@@ -262,6 +262,9 @@ async function viewPhotos() {
 // --------------------------- Photo detail ---------------------------
 const SVGNS = "http://www.w3.org/2000/svg";
 
+// Face-box visibility chosen while browsing one person's photos.
+let personOverlayPref = { personId: null, show: true };
+
 // Where the photo was opened from: `#/photo/:id?person=N` browses that person's
 // photos (timeline order); otherwise the active album grid.
 function photoContext() {
@@ -380,7 +383,11 @@ async function viewPhotoDetail(id) {
   let spaceLocked = false;
 
   // Whether the face polygons/labels are drawn over the photo (view-only).
-  let showOverlay = true;
+  // Within a person context the choice carries over while browsing Prev/Next.
+  let showOverlay =
+    navCtx.personId && personOverlayPref.personId === navCtx.personId
+      ? personOverlayPref.show
+      : true;
 
   const dims = () =>
     space === "aligned"
@@ -668,8 +675,11 @@ async function viewPhotoDetail(id) {
   }
   overlayBtn.addEventListener("click", () => {
     showOverlay = !showOverlay;
+    if (navCtx.personId)
+      personOverlayPref = { personId: navCtx.personId, show: showOverlay };
     applyOverlayVisibility();
   });
+  applyOverlayVisibility();
 
   adjustBtn.addEventListener("click", () => openAdjustEditor(id, reload));
   rerunBtn.addEventListener("click", async () => {
@@ -1543,6 +1553,23 @@ async function viewPerson(id) {
         );
       }
       relSec.box.appendChild(auto);
+    }
+    const incoming = detail.incoming_relations || [];
+    if (incoming.length) {
+      const inc = el(
+        `<div class="auto-rels incoming-rels"><span class="muted">Set on other people's pages:</span></div>`
+      );
+      const me = detail.display_name || "this person";
+      for (const r of incoming) {
+        const label =
+          r.kind === "custom" ? r.custom_label || "related" : r.kind;
+        const who = r.person_name || "?";
+        inc.appendChild(
+          el(`<a class="auto-chip${r.is_auto ? "" : " incoming-chip"}" href="#/person/${r.person_id}"
+            title="${r.is_auto ? "Auto-deduced; " : ""}edit on ${esc(who)}'s page">${esc(who)} is ${esc(label)} of ${esc(me)}</a>`)
+        );
+      }
+      relSec.box.appendChild(inc);
     }
     form.appendChild(relSec.box);
 

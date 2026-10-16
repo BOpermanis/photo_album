@@ -792,6 +792,27 @@ def _person_detail(session: Session, person: Person) -> dict:
             "note": r.note,
             "is_auto": r.is_auto,
         })
+    # Relations stored on other people that point at this person, so a person
+    # page shows every relation they take part in, whichever side entered it.
+    incoming = session.exec(
+        select(PersonRelation).where(
+            PersonRelation.related_person_id == person.id,
+            PersonRelation.person_id != person.id,
+        )
+    ).all()
+    incoming_out = []
+    for r in incoming:
+        owner = session.get(Person, r.person_id)
+        incoming_out.append({
+            "id": r.id,
+            "person_id": r.person_id,
+            "person_name": owner.display_name if owner else None,
+            "kind": r.kind,
+            "custom_label": r.custom_label,
+            "note": r.note,
+            "is_auto": r.is_auto,
+        })
+    incoming_out.sort(key=lambda d: (d["is_auto"], (d["person_name"] or "").casefold()))
     photo_count = session.exec(
         select(func.count(func.distinct(Face.photo_id))).where(
             Face.person_id == person.id
@@ -818,6 +839,7 @@ def _person_detail(session: Session, person: Person) -> dict:
             for p in profs
         ],
         "relations": rel_out,
+        "incoming_relations": incoming_out,
         "relation_presets": person_parse.RELATION_PRESETS,
     }
 

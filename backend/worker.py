@@ -111,8 +111,10 @@ def _run_detection(engine, detector, photo_id: int, label: str) -> None:
         session.add(photo)
         session.commit()
         count = len(results)
-        # Tags on the replaced faces are gone; refresh those persons' timelines.
-        timeline.reorder_persons(session, affected_persons)
+        # Tags on the replaced faces are gone, and the new faces need ages.
+        jobs.enqueue(session, photo_id, "age")
+        if affected_persons:
+            timeline.mark_dirty(session)
     print(f"[worker] {label} photo={photo_id}: {count} face(s)")
 
 
@@ -164,11 +166,65 @@ def handle_rerun_detect(engine, detector, photo_id: int) -> None:
     _run_detection(engine, detector, photo_id, "rerun_detect")
 
 
+def handle_age(engine, detector, photo_id: int) -> None:
+    """Estimate the apparent age of every face in the photo that has none yet.
+    Uses the same image detection used (aligned copy when its polygon exists)."""
+    from .age import get_estimator, open_rgb
+
+    with Session(engine) as session:
+        photo = session.get(Photo, photo_id)
+        if photo is None:
+            return
+        todo = []  # (face_id, image name, box)
+        for f in session.exec(
+            select(Face).where(Face.photo_id == photo_id, Face.age.is_(None))
+        ).all():
+            if photo.edited_filename and f.poly_aligned:
+                x1, y1, x2, y2 = _poly_bounds(json.loads(f.poly_aligned))
+                todo.append((f.id, photo.edited_filename, (x1, y1, x2, y2)))
+            else:
+                todo.append((f.id, photo.filename, (f.x, f.y, f.x + f.w, f.y + f.h)))
+    if not todo:
+        return
+
+    estimator = get_estimator()
+    ages = {}
+    for name in {t[1] for t in todo}:
+        group = [t for t in todo if t[1] == name]
+        image = open_rgb(LIBRARY_DIR / name)
+        for (face_id, _, _), est in zip(group, estimator.estimate(image, [t[2] for t in group])):
+            ages[face_id] = est
+
+    tagged = False
+    with Session(engine) as session:
+        for face_id, (mean, sd) in ages.items():
+            face = session.get(Face, face_id)
+            if face is None:  # replaced by a re-detection meanwhile
+                continue
+            face.age, face.age_sd = mean, sd
+            tagged = tagged or face.person_id is not None
+            session.add(face)
+        session.commit()
+        if tagged:
+            timeline.mark_dirty(session)
+    print(f"[worker] age photo={photo_id}: {len(ages)} face(s)")
+
+
+def _poly_bounds(poly):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 _HANDLERS = {
     "detect": handle_detect,
     "align": handle_align,
     "rerun_detect": handle_rerun_detect,
+    "age": handle_age,
 }
+# Kinds served by the general (detector-loading) workers; `age` and the
+# interactive `align` work also have dedicated lanes.
+_GENERAL_KINDS = ("detect", "rerun_detect", "align")
 
 
 # ------------------------------- pool plumbing ----------------------------
@@ -217,9 +273,23 @@ def start_pool():
     stop_event = ctx.Event()
     procs = []
     for _ in range(max(1, WORKER_PROCESSES)):
-        proc = ctx.Process(target=_worker_main, args=(stop_event,), daemon=True)
+        proc = ctx.Process(
+            target=_worker_main,
+            args=(stop_event,),
+            kwargs={"kinds": _GENERAL_KINDS},
+            daemon=True,
+        )
         proc.start()
         procs.append(proc)
+    # Apparent-age lane: loads only the (torch) age model, never the detector.
+    age_lane = ctx.Process(
+        target=_worker_main,
+        args=(stop_event,),
+        kwargs={"kinds": ("age",), "load_detector": False},
+        daemon=True,
+    )
+    age_lane.start()
+    procs.append(age_lane)
     interactive = ctx.Process(
         target=_worker_main,
         args=(stop_event,),
