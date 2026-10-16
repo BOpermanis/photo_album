@@ -75,6 +75,13 @@ def _run_migrations() -> None:
         if "taken_at" not in photo_cols:
             conn.execute(text("ALTER TABLE photo ADD COLUMN taken_at TIMESTAMP"))
         _backfill_taken_at(conn)
+        if "date" not in photo_cols:
+            conn.execute(text("ALTER TABLE photo ADD COLUMN date TEXT DEFAULT ''"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_photo_date ON photo (date)"))
+            # One-time: later edits to `date` must not be overwritten on restart.
+            backfill_photo_dates(conn)
+        if "pinned_year" not in photo_cols:
+            conn.execute(text("ALTER TABLE photo ADD COLUMN pinned_year FLOAT"))
 
         face_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(face)"))}
         if "poly_original" not in face_cols:
@@ -83,6 +90,10 @@ def _run_migrations() -> None:
             conn.execute(text("ALTER TABLE face ADD COLUMN poly_aligned TEXT DEFAULT ''"))
         if "embedding" not in face_cols:
             conn.execute(text("ALTER TABLE face ADD COLUMN embedding BLOB"))
+        if "use_for_recognition" not in face_cols:
+            conn.execute(
+                text("ALTER TABLE face ADD COLUMN use_for_recognition BOOLEAN DEFAULT 1")
+            )
 
         rel_cols = {
             row[1] for row in conn.execute(text("PRAGMA table_info(personrelation)"))
@@ -337,6 +348,29 @@ def _backfill_taken_at(conn) -> None:
             text("UPDATE photo SET taken_at = :ts WHERE id = :pid"),
             {"ts": value, "pid": pid},
         )
+
+
+def backfill_photo_dates(conn, overwrite: bool = False) -> list[tuple[int, str, str]]:
+    """Set photo.date from the leading date of each description. Without
+    `overwrite`, only photos with an empty date are touched. Returns the
+    (photo_id, old_date, new_date) rows that changed."""
+    from .date_parse import parse_description_date
+
+    rows = list(
+        conn.execute(text("SELECT id, COALESCE(description, ''), COALESCE(date, '') FROM photo"))
+    )
+    changed = []
+    for pid, description, old in rows:
+        if old and not overwrite:
+            continue
+        new = parse_description_date(description)
+        if new == old:
+            continue
+        conn.execute(
+            text("UPDATE photo SET date = :d WHERE id = :pid"), {"d": new, "pid": pid}
+        )
+        changed.append((pid, old, new))
+    return changed
 
 
 def get_session():

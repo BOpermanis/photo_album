@@ -87,6 +87,14 @@ class Photo(SQLModel, table=True):
     taken_at: Optional[datetime] = Field(default=None)
     processed: bool = Field(default=False)
     description: str = Field(default="")
+    # Date the photo depicts, at whatever precision is known: "YYYY",
+    # "YYYY/MM", or "YYYY/MM/DD" ("" = unknown). Backfilled from the leading
+    # date in the description (see date_parse.py).
+    date: str = Field(default="", index=True)
+    # Year set by dragging an undated photo within a person's timeline; acts as
+    # a known date for ordering everyone in the photo (see timeline.py).
+    # Cleared when a real `date` is entered.
+    pinned_year: Optional[float] = Field(default=None)
     # Perspective-corrected copy of the original (empty = none). The original
     # upload is always kept; faces and display use the edited copy when present.
     edited_filename: str = Field(default="")
@@ -115,6 +123,19 @@ class Face(SQLModel, table=True):
     embedding: Optional[bytes] = Field(default=None, sa_type=LargeBinary)
     confidence: float = 0.0
     person_id: Optional[int] = Field(default=None, foreign_key="person.id", index=True)
+    # False keeps a (poor-quality) face tagged but out of the recognition index.
+    use_for_recognition: bool = Field(default=True)
+
+
+class PersonPhotoOrder(SQLModel, table=True):
+    # Chronological position of a photo on a person's page, recomputed by
+    # timeline.reorder_persons() whenever the person's photo set or a date changes.
+    person_id: int = Field(foreign_key="person.id", primary_key=True)
+    photo_id: int = Field(foreign_key="photo.id", primary_key=True, index=True)
+    position: int = 0
+    # Year inferred from face similarity for an undated photo (None when the
+    # photo has a date or could not be estimated).
+    estimated_year: Optional[float] = Field(default=None)
 
 
 class Job(SQLModel, table=True):

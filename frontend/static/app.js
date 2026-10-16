@@ -377,9 +377,13 @@ async function viewPhotoDetail(id) {
   stage.appendChild(overlay);
   stage.appendChild(labels);
 
-  // Description editor (persists across face reloads).
+  // Date + description editor (persists across face reloads).
   const descBox = el(`
     <div class="desc-box">
+      <label class="desc-label" for="photoDate">Date</label>
+      <input id="photoDate" class="desc-input date-input" type="text" maxlength="10"
+        autocomplete="off" placeholder="YYYY/MM/DD" value="${esc(photo.date || "")}"/>
+      <div class="desc-hint muted">YYYY, YYYY/MM or YYYY/MM/DD</div>
       <label class="desc-label">Description</label>
       <textarea class="desc-input" rows="3" placeholder="Add a note about this photo…">${esc(photo.description || "")}</textarea>
       <div class="desc-actions">
@@ -389,19 +393,38 @@ async function viewPhotoDetail(id) {
     </div>
   `);
   descWrap.appendChild(descBox);
-  const descInput = descBox.querySelector(".desc-input");
+  const dateInput = descBox.querySelector(".date-input");
+  const descInput = descBox.querySelector("textarea.desc-input");
   const descStatus = descBox.querySelector(".desc-status");
-  descBox.querySelector(".desc-save").addEventListener("click", async () => {
+  const DATE_RE = /^\d{4}(\/\d{1,2}(\/\d{1,2})?)?$/;
+  dateInput.addEventListener("input", () => {
+    const v = dateInput.value.trim();
+    dateInput.classList.toggle("invalid", v !== "" && !DATE_RE.test(v));
+  });
+  const saveDesc = async () => {
+    const date = dateInput.value.trim();
+    if (date && !DATE_RE.test(date)) {
+      descStatus.textContent = "Date must be YYYY, YYYY/MM or YYYY/MM/DD";
+      return;
+    }
     descStatus.textContent = "Saving…";
     try {
-      await postJSON(`/api/photos/${id}/description`, {
+      const res = await postJSON(`/api/photos/${id}/description`, {
         description: descInput.value,
+        date,
       });
-      photo.description = descInput.value.trim();
+      photo.description = res.description;
+      photo.date = res.date;
+      dateInput.value = res.date;
+      dateInput.classList.remove("invalid");
       descStatus.textContent = "Saved";
     } catch (e) {
       descStatus.textContent = e.message;
     }
+  };
+  descBox.querySelector(".desc-save").addEventListener("click", saveDesc);
+  dateInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") saveDesc();
   });
 
   // datalist for autocomplete
@@ -483,6 +506,10 @@ async function viewPhotoDetail(id) {
               value="${named ? esc(f.person_name) : ""}" />
             <button class="save">Save</button>
           </div>
+          <label class="use-recog" title="Include this face in the recognition index">
+            <input type="checkbox" class="recog" ${f.use_for_recognition !== false ? "checked" : ""} />
+            Use for face recognition
+          </label>
           <div class="row">
             ${named ? `<button class="secondary clear">Remove name</button>` : ""}
             <button class="danger notface">Not a face</button>
@@ -528,6 +555,19 @@ async function viewPhotoDetail(id) {
       item.querySelector(".save").addEventListener("click", save);
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") save();
+      });
+
+      const recogBox = item.querySelector(".recog");
+      recogBox.addEventListener("change", async () => {
+        try {
+          await postJSON(`/api/faces/${f.id}/recognition`, {
+            enabled: recogBox.checked,
+          });
+          await reload();
+        } catch (e) {
+          recogBox.checked = !recogBox.checked;
+          alert(e.message);
+        }
       });
 
       const clearBtn = item.querySelector(".clear");
@@ -1269,10 +1309,51 @@ async function viewRelations() {
     });
 }
 
+// Prev/Next follow the /api/persons order, i.e. the same order as #/people.
+function setupPersonNav(view, list, id) {
+  const ids = list.map((p) => p.id);
+  const i = ids.indexOf(Number(id));
+  const prevId = i > 0 ? ids[i - 1] : null;
+  const nextId = i !== -1 && i < ids.length - 1 ? ids[i + 1] : null;
+  const prevBtn = view.querySelector(".nav-prev");
+  const nextBtn = view.querySelector(".nav-next");
+  if (prevId != null) {
+    prevBtn.disabled = false;
+    prevBtn.addEventListener("click", () => (location.hash = `#/person/${prevId}`));
+  }
+  if (nextId != null) {
+    nextBtn.disabled = false;
+    nextBtn.addEventListener("click", () => (location.hash = `#/person/${nextId}`));
+  }
+
+  function onKey(e) {
+    if (!view.isConnected) {
+      window.removeEventListener("keydown", onKey);
+      return;
+    }
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (document.querySelector(".editor-overlay")) return;
+    if (e.key === "ArrowLeft" && prevId != null) {
+      e.preventDefault();
+      location.hash = `#/person/${prevId}`;
+    } else if (e.key === "ArrowRight" && nextId != null) {
+      e.preventDefault();
+      location.hash = `#/person/${nextId}`;
+    }
+  }
+  window.addEventListener("keydown", onKey);
+}
+
 async function viewPerson(id) {
   const view = el(`
     <div>
-      <a class="back" href="#/people">← Back to people</a>
+      <div class="toolbar detail-nav">
+        <a class="back" href="#/people">← Back to people</a>
+        <span class="toolbar-spacer"></span>
+        <button class="chip nav-prev" disabled>← Prev</button>
+        <button class="chip nav-next" disabled>Next →</button>
+      </div>
       <h1 id="pname">Person</h1>
       <div id="editorWrap"></div>
       <h2 class="section-title">Photos</h2>
@@ -1298,6 +1379,7 @@ async function viewPerson(id) {
   const others = persons.persons.filter((p) => p.id !== detail.id);
   const presets = detail.relation_presets || [];
 
+  setupPersonNav(view, persons.persons, detail.id);
   setName();
   renderEditor();
   renderPhotos();
@@ -1498,18 +1580,213 @@ async function viewPerson(id) {
 
   function renderPhotos() {
     if (!photoData.photos.length) {
-      wrap.appendChild(el(`<div class="empty">No photos.</div>`));
+      wrap.replaceChildren(el(`<div class="empty">No photos.</div>`));
       return;
     }
     const grid = el(`<div class="grid"></div>`);
+    let anyDraggable = false;
     for (const p of photoData.photos) {
+      let label = "";
+      if (p.date) label = `<span class="date-label">${esc(p.date)}</span>`;
+      else if (p.pinned_year != null)
+        label = `<span class="date-label pinned" title="Placed manually">📌 ≈ ${Math.floor(p.pinned_year)}<button class="unpin" type="button" title="Remove manual placement">×</button></span>`;
+      else if (p.estimated_year != null)
+        label = `<span class="date-label estimated" title="Estimated from face similarity to dated photos">≈ ${Math.floor(p.estimated_year)}</span>`;
+      // Dated photos follow their date; only undated ones can be dragged.
+      const draggable = !p.date;
+      anyDraggable = anyDraggable || draggable;
       const card = el(
-        `<div class="card"><img loading="lazy" src="/media/${esc(p.display_filename || p.filename)}?size=200" alt=""/></div>`
+        `<div class="card" data-id="${p.id}" ${draggable ? "data-draggable" : ""}>${label}<img loading="lazy" draggable="false" src="/media/${esc(p.display_filename || p.filename)}?size=200" alt=""/></div>`
       );
       card.addEventListener("click", () => (location.hash = `#/photo/${p.id}`));
+      const unpin = card.querySelector(".unpin");
+      if (unpin)
+        unpin.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          try {
+            await del(`/api/photos/${p.id}/pin`);
+            photoData = await getJSON(`/api/persons/${id}/photos`);
+            renderPhotos();
+          } catch (err) {
+            alert(err.message);
+          }
+        });
       grid.appendChild(card);
     }
-    wrap.appendChild(grid);
+    enableGridReorder(grid, async (photoId, prevId, nextId) => {
+      grid.classList.add("busy");
+      try {
+        photoData = await postJSON(`/api/persons/${id}/photos/${photoId}/move`, {
+          prev_id: prevId,
+          next_id: nextId,
+        });
+      } catch (err) {
+        alert(err.message);
+      }
+      renderPhotos();
+    });
+    const hint = anyDraggable
+      ? el(`<div class="muted timeline-hint">Oldest first. ≈ years are estimated from faces — drag an undated photo to fix its place (long-press on touch).</div>`)
+      : el(`<div class="muted timeline-hint">Oldest first.</div>`);
+    wrap.replaceChildren(hint, grid);
+  }
+}
+
+// Reorder cards of a .grid with the mouse, or long-press then drag on touch.
+// Only cards with [data-draggable] can be picked up; any card can be a drop
+// neighbour. Calls onDrop(id, prevId, nextId) with the dragged card's new
+// neighbours (null at either end); nothing happens if they did not change.
+function enableGridReorder(grid, onDrop) {
+  const LONG_PRESS_MS = 350;
+  const EDGE = 60;
+  let drag = null;
+  let justDragged = false;
+
+  const cardIds = () => [...grid.querySelectorAll(".card")].map((c) => Number(c.dataset.id));
+
+  grid.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || drag) return;
+    const card = e.target.closest(".card[data-draggable]");
+    if (!card || e.target.closest("button")) return;
+    drag = {
+      card,
+      id: Number(card.dataset.id),
+      pointerId: e.pointerId,
+      touch: e.pointerType !== "mouse",
+      x0: e.clientX,
+      y0: e.clientY,
+      x: e.clientX,
+      y: e.clientY,
+      active: false,
+    };
+    if (drag.touch) drag.timer = setTimeout(start, LONG_PRESS_MS);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("keydown", onKey);
+  });
+
+  // Once a touch drag is active, stop the page from scrolling under the finger.
+  grid.addEventListener(
+    "touchmove",
+    (e) => {
+      if (drag && drag.active) e.preventDefault();
+    },
+    { passive: false }
+  );
+  grid.addEventListener("contextmenu", (e) => {
+    if (drag) e.preventDefault();
+  });
+  // Swallow the click that follows a drop so it doesn't open the photo.
+  grid.addEventListener(
+    "click",
+    (e) => {
+      if (justDragged) {
+        e.stopPropagation();
+        e.preventDefault();
+        justDragged = false;
+      }
+    },
+    true
+  );
+
+  function start() {
+    if (!drag || drag.active) return;
+    drag.active = true;
+    const r = drag.card.getBoundingClientRect();
+    const ghost = drag.card.cloneNode(true);
+    ghost.classList.add("drag-ghost");
+    ghost.style.width = `${r.width}px`;
+    ghost.style.height = `${r.height}px`;
+    drag.offX = drag.x - r.left;
+    drag.offY = drag.y - r.top;
+    drag.ghost = ghost;
+    document.body.appendChild(ghost);
+    drag.card.classList.add("dragging");
+    if (navigator.vibrate) navigator.vibrate(15);
+    drag.scroller = setInterval(autoScroll, 16);
+    update();
+  }
+
+  function onMove(e) {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    drag.x = e.clientX;
+    drag.y = e.clientY;
+    const dist = Math.hypot(drag.x - drag.x0, drag.y - drag.y0);
+    if (!drag.active) {
+      if (drag.touch) {
+        if (dist > 10) cancel(); // moved before the long-press: it's a scroll
+      } else if (dist > 6) {
+        start();
+      }
+      return;
+    }
+    update();
+  }
+
+  function autoScroll() {
+    if (!drag) return;
+    if (drag.y < EDGE) window.scrollBy(0, -12);
+    else if (drag.y > window.innerHeight - EDGE) window.scrollBy(0, 12);
+    else return;
+    update();
+  }
+
+  function clearMarks() {
+    for (const c of grid.querySelectorAll(".drop-before, .drop-after"))
+      c.classList.remove("drop-before", "drop-after");
+  }
+
+  function update() {
+    drag.ghost.style.left = `${drag.x - drag.offX}px`;
+    drag.ghost.style.top = `${drag.y - drag.offY}px`;
+    clearMarks();
+    drag.target = null;
+    const hit = document.elementFromPoint(drag.x, drag.y);
+    const over = hit && hit.closest(".card");
+    if (!over || !grid.contains(over) || over === drag.card) return;
+    const r = over.getBoundingClientRect();
+    drag.before = drag.x < r.left + r.width / 2;
+    drag.target = over;
+    over.classList.add(drag.before ? "drop-before" : "drop-after");
+  }
+
+  function onUp(e) {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    const d = drag;
+    cancel();
+    if (!d.active) return;
+    justDragged = true;
+    setTimeout(() => (justDragged = false), 0);
+    if (!d.target) return;
+    const all = cardIds();
+    const oldIdx = all.indexOf(d.id);
+    const oldPrev = oldIdx > 0 ? all[oldIdx - 1] : null;
+    const oldNext = oldIdx < all.length - 1 ? all[oldIdx + 1] : null;
+    const rest = all.filter((x) => x !== d.id);
+    const idx = rest.indexOf(Number(d.target.dataset.id)) + (d.before ? 0 : 1);
+    const prev = idx > 0 ? rest[idx - 1] : null;
+    const next = idx < rest.length ? rest[idx] : null;
+    if (prev === oldPrev && next === oldNext) return;
+    onDrop(d.id, prev, next);
+  }
+
+  function onKey(e) {
+    if (e.key === "Escape") cancel();
+  }
+
+  function cancel() {
+    if (!drag) return;
+    clearTimeout(drag.timer);
+    clearInterval(drag.scroller);
+    if (drag.ghost) drag.ghost.remove();
+    drag.card.classList.remove("dragging");
+    clearMarks();
+    drag = null;
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", cancel);
+    window.removeEventListener("keydown", onKey);
   }
 }
 

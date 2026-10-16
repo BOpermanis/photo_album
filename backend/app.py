@@ -16,8 +16,9 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 from sqlmodel import Session, func, select
 
-from . import export, jobs, person_parse, recognize, relations, warp, worker
+from . import export, jobs, person_parse, recognize, relations, timeline, warp, worker
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT, THUMB_DIR, THUMBNAIL_MAX_SIZE
+from .date_parse import normalize_date
 from .db import engine, get_session, init_db
 from .models import (
     Album,
@@ -103,6 +104,9 @@ async def lifespan(app: FastAPI):
     init_db()
     recognize.load()
     with Session(engine) as session:
+        # Refresh stored person timelines in case dates/tags changed offline
+        # (migrations, scripts).
+        timeline.reorder_all(session)
         requeued = jobs.requeue_stale(session)
         if requeued:
             print(f"[jobs] requeued {requeued} stale job(s)")
@@ -171,6 +175,7 @@ def _face_dict(session: Session, face: Face) -> dict:
         "confidence": face.confidence,
         "person_id": face.person_id,
         "person_name": person_name,
+        "use_for_recognition": face.use_for_recognition is not False,
     }
 
 
@@ -186,6 +191,7 @@ def _photo_summary(session: Session, photo: Photo) -> dict:
         "width": photo.width,
         "height": photo.height,
         "processed": photo.processed,
+        "date": photo.date,
         "face_count": len(faces),
         "untagged_count": untagged,
         "detect_pending": flags["detect_pending"],
@@ -289,6 +295,7 @@ def _photo_detail(session: Session, photo: Photo) -> dict:
         "original_height": photo.original_height or photo.height,
         "processed": photo.processed,
         "description": photo.description,
+        "date": photo.date,
         "has_edit": bool(photo.edited_filename),
         "detect_pending": flags["detect_pending"],
         "align_pending": flags["align_pending"],
@@ -353,6 +360,8 @@ def stream_photo(photo_id: int):
 
 class DescriptionBody(BaseModel):
     description: str
+    # None leaves the date unchanged; "" clears it.
+    date: Optional[str] = None
 
 
 @app.post("/api/photos/{photo_id}/description")
@@ -362,27 +371,48 @@ def update_description(
     photo = session.get(Photo, photo_id)
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
+    if body.date is not None:
+        date = normalize_date(body.date)
+        if date is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Date must be YYYY, YYYY/MM or YYYY/MM/DD",
+            )
+        date_changed = date != photo.date
+        photo.date = date
+        if date:
+            # A real date supersedes any manual timeline placement.
+            photo.pinned_year = None
+    else:
+        date_changed = False
     photo.description = body.description.strip()
     session.add(photo)
     session.commit()
-    return {"id": photo.id, "description": photo.description}
+    if date_changed:
+        timeline.reorder_persons(session, timeline.persons_in_photos(session, [photo.id]))
+    return {"id": photo.id, "description": photo.description, "date": photo.date}
 
 
-def _purge_photo(session: Session, photo: Photo) -> tuple[list[int], list[str]]:
+def _purge_photo(
+    session: Session, photo: Photo
+) -> tuple[list[int], list[str], set[int]]:
     """Delete a photo's faces, queued jobs and photo row (without committing).
 
-    Returns the reference-face ids to drop from the recognition index and the
-    image files to unlink; the caller commits, then applies both side effects.
+    Returns the reference-face ids to drop from the recognition index, the
+    image files to unlink, and the persons whose photo order must be
+    recomputed; the caller commits, then applies the side effects.
     """
     faces = session.exec(select(Face).where(Face.photo_id == photo.id)).all()
     ref_ids = [f.id for f in faces if f.person_id is not None]
+    person_ids = {f.person_id for f in faces if f.person_id is not None}
     for f in faces:
         session.delete(f)
     for job in session.exec(select(Job).where(Job.photo_id == photo.id)).all():
         session.delete(job)
+    timeline.delete_photo_rows(session, photo.id)
     files = [name for name in (photo.filename, photo.edited_filename) if name]
     session.delete(photo)
-    return ref_ids, files
+    return ref_ids, files, person_ids
 
 
 @app.delete("/api/photos/{photo_id}")
@@ -390,8 +420,9 @@ def delete_photo(photo_id: int, session: Session = Depends(get_session)):
     photo = session.get(Photo, photo_id)
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
-    ref_ids, files = _purge_photo(session, photo)
+    ref_ids, files, person_ids = _purge_photo(session, photo)
     session.commit()
+    timeline.reorder_persons(session, person_ids)
     for face_id in ref_ids:
         recognize.remove(face_id)
     for name in files:
@@ -528,15 +559,20 @@ def assign_face(
     else:
         raise HTTPException(status_code=400, detail="Provide name or person_id")
 
+    old_person_id = face.person_id
     face.person_id = person.id
     session.add(face)
     session.commit()
     _index_reference_face(session, face, person.id)
+    timeline.reorder_persons(session, {old_person_id, person.id})
     return _face_dict(session, face)
 
 
 def _index_reference_face(session: Session, face: Face, person_id: int) -> None:
     """Add a confirmed face's embedding to the in-memory recognition index."""
+    if face.use_for_recognition is False:
+        recognize.remove(face.id)
+        return
     emb = _face_embedding(face)
     if emb is not None:
         recognize.add(face.id, person_id, emb)
@@ -545,15 +581,37 @@ def _index_reference_face(session: Session, face: Face, person_id: int) -> None:
         print(f"[recognize] no embedding for face {face.id}; skipping index")
 
 
+class RecognitionBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/faces/{face_id}/recognition")
+def set_face_recognition(
+    face_id: int, body: RecognitionBody, session: Session = Depends(get_session)
+):
+    """Include/exclude a face from the recognition index without untagging it."""
+    face = session.get(Face, face_id)
+    if not face:
+        raise HTTPException(status_code=404, detail="Face not found")
+    face.use_for_recognition = body.enabled
+    session.add(face)
+    session.commit()
+    if face.person_id is not None:
+        _index_reference_face(session, face, face.person_id)
+    return _face_dict(session, face)
+
+
 @app.post("/api/faces/{face_id}/unassign")
 def unassign_face(face_id: int, session: Session = Depends(get_session)):
     face = session.get(Face, face_id)
     if not face:
         raise HTTPException(status_code=404, detail="Face not found")
+    old_person_id = face.person_id
     face.person_id = None
     session.add(face)
     session.commit()
     recognize.remove(face_id)
+    timeline.reorder_persons(session, [old_person_id])
     return _face_dict(session, face)
 
 
@@ -562,9 +620,11 @@ def delete_face(face_id: int, session: Session = Depends(get_session)):
     face = session.get(Face, face_id)
     if not face:
         raise HTTPException(status_code=404, detail="Face not found")
+    old_person_id = face.person_id
     session.delete(face)
     session.commit()
     recognize.remove(face_id)
+    timeline.reorder_persons(session, [old_person_id])
     return {"status": "deleted", "id": face_id}
 
 
@@ -866,15 +926,80 @@ def person_photos(person_id: int, session: Session = Depends(get_session)):
     person = session.get(Person, person_id)
     if not person:
         raise HTTPException(status_code=404, detail="Person not found")
-    photo_ids = session.exec(
-        select(Face.photo_id).where(Face.person_id == person_id).distinct()
-    ).all()
-    photos = [session.get(Photo, pid) for pid in photo_ids]
-    summaries = [_photo_summary(session, p) for p in photos if p]
+    # Precomputed chronological order (see timeline.py): oldest first, undated
+    # photos slotted in at a year estimated from face similarity.
+    summaries = []
+    for row in timeline.ordered_photos(session, person_id):
+        photo = session.get(Photo, row.photo_id)
+        if not photo:
+            continue
+        s = _photo_summary(session, photo)
+        s["estimated_year"] = row.estimated_year
+        s["pinned_year"] = None if photo.date else photo.pinned_year
+        summaries.append(s)
     return {
         "person": {"id": person.id, "name": person.display_name},
         "photos": summaries,
     }
+
+
+class MoveBody(BaseModel):
+    # Neighbours in the person's timeline where the photo was dropped
+    # (None at either end).
+    prev_id: Optional[int] = None
+    next_id: Optional[int] = None
+
+
+@app.post("/api/persons/{person_id}/photos/{photo_id}/move")
+def move_person_photo(
+    person_id: int,
+    photo_id: int,
+    body: MoveBody,
+    session: Session = Depends(get_session),
+):
+    """Manually place an undated photo between two neighbours. The photo gets a
+    pinned year that anchors it in every timeline it appears in."""
+    if not session.get(Person, person_id):
+        raise HTTPException(status_code=404, detail="Person not found")
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if photo.date:
+        raise HTTPException(
+            status_code=400, detail="Dated photos follow their date; edit the date instead"
+        )
+    rows = {r.photo_id: r for r in timeline.ordered_photos(session, person_id)}
+    if photo_id not in rows:
+        raise HTTPException(status_code=400, detail="Photo is not in this timeline")
+
+    def neighbour_year(pid: Optional[int]) -> Optional[float]:
+        if pid is None or pid == photo_id or pid not in rows:
+            return None
+        p = session.get(Photo, pid)
+        year = timeline.anchor_year(p) if p else None
+        return year if year is not None else rows[pid].estimated_year
+
+    year = timeline.pin_between(neighbour_year(body.prev_id), neighbour_year(body.next_id))
+    if year is None:
+        raise HTTPException(status_code=400, detail="Neighbours have no known year")
+    photo.pinned_year = year
+    session.add(photo)
+    session.commit()
+    timeline.reorder_persons(session, timeline.persons_in_photos(session, [photo_id]))
+    return person_photos(person_id, session)
+
+
+@app.delete("/api/photos/{photo_id}/pin")
+def unpin_photo(photo_id: int, session: Session = Depends(get_session)):
+    """Drop a manual timeline placement; the photo's year is estimated again."""
+    photo = session.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    photo.pinned_year = None
+    session.add(photo)
+    session.commit()
+    timeline.reorder_persons(session, timeline.persons_in_photos(session, [photo_id]))
+    return {"id": photo.id, "pinned_year": None}
 
 
 # ------------------------------- relations --------------------------------
@@ -1118,12 +1243,15 @@ def delete_album(album_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Album not found")
     ref_ids: list[int] = []
     files: list[str] = []
+    person_ids: set[int] = set()
     for photo in session.exec(select(Photo).where(Photo.album_id == album_id)).all():
-        photo_refs, photo_files = _purge_photo(session, photo)
+        photo_refs, photo_files, photo_persons = _purge_photo(session, photo)
         ref_ids += photo_refs
         files += photo_files
+        person_ids |= photo_persons
     session.delete(album)
     session.commit()
+    timeline.reorder_persons(session, person_ids)
     for face_id in ref_ids:
         recognize.remove(face_id)
     for name in files:

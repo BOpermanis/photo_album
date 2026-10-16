@@ -16,7 +16,7 @@ import traceback
 import numpy as np
 from sqlmodel import Session, select
 
-from . import db, jobs, warp
+from . import db, jobs, timeline, warp
 from .config import (
     INTERACTIVE_POLL_INTERVAL,
     LIBRARY_DIR,
@@ -74,7 +74,9 @@ def _run_detection(engine, detector, photo_id: int, label: str) -> None:
         photo = session.get(Photo, photo_id)
         if photo is None:
             return
-        for old in session.exec(select(Face).where(Face.photo_id == photo_id)).all():
+        old_faces = session.exec(select(Face).where(Face.photo_id == photo_id)).all()
+        affected_persons = {f.person_id for f in old_faces if f.person_id is not None}
+        for old in old_faces:
             session.delete(old)
         if use_aligned:
             photo.width, photo.height = width, height
@@ -109,6 +111,8 @@ def _run_detection(engine, detector, photo_id: int, label: str) -> None:
         session.add(photo)
         session.commit()
         count = len(results)
+        # Tags on the replaced faces are gone; refresh those persons' timelines.
+        timeline.reorder_persons(session, affected_persons)
     print(f"[worker] {label} photo={photo_id}: {count} face(s)")
 
 

@@ -29,7 +29,13 @@ Backend package `backend/`, launched by [run.py](run.py):
   ordered by `priority DESC, id DESC`.
 - [backend/db.py](backend/db.py) — engine, WAL pragmas, and additive migrations.
 - [backend/models.py](backend/models.py) — SQLModel tables (`Album`, `Person`,
-  `Photo`, `Face`, `Job`, `FaceIndexEntry`).
+  `Photo`, `Face`, `Job`, `FaceIndexEntry`, `PersonPhotoOrder`).
+- [backend/timeline.py](backend/timeline.py) — chronological order of each person's
+  photos, stored in `PersonPhotoOrder`; undated photos get a year estimated by harmonic
+  label propagation over face embeddings, while `Photo.pinned_year` (set by dragging a
+  card on the person page) acts as a fixed anchor like a real date. Call
+  `timeline.reorder_persons()` after any change to a person's tagged photos, a photo's
+  `date`, or its `pinned_year`.
 - [backend/detect.py](backend/detect.py) — InsightFace detector, per-process singleton.
 - [backend/recognize.py](backend/recognize.py) — in-memory Annoy index of user-confirmed
   reference faces.

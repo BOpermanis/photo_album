@@ -205,6 +205,78 @@ input[type="text"] {
 .badge.warn { background: rgba(255, 92, 92, 0.85); }
 .badge.ok { background: rgba(46, 204, 113, 0.85); }
 
+.date-label {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  background: rgba(0, 0, 0, 0.65);
+  color: white;
+  font-size: 0.72rem;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+.date-label.estimated {
+  font-style: italic;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px dashed rgba(255, 255, 255, 0.6);
+}
+.date-label.pinned {
+  background: rgba(79, 140, 255, 0.85);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.date-label .unpin {
+  background: none;
+  border: none;
+  color: white;
+  padding: 0 0 0 2px;
+  font-size: 0.9rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* Person timeline drag-to-reorder */
+.timeline-hint {
+  margin: -4px 0 10px;
+  font-size: 0.85rem;
+}
+.card[data-draggable] {
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.card.dragging {
+  opacity: 0.35;
+}
+.drag-ghost {
+  position: fixed;
+  z-index: 1000;
+  margin: 0;
+  pointer-events: none;
+  opacity: 0.9;
+  transform: scale(1.05);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  cursor: grabbing;
+}
+.card.drop-before::after,
+.card.drop-after::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  background: var(--accent);
+  z-index: 2;
+}
+.card.drop-before::after { left: 0; }
+.card.drop-after::after { right: 0; }
+.grid.busy {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
 /* Detail */
 .detail {
   display: grid;
@@ -388,6 +460,17 @@ input[type="text"] {
 .desc-status {
   font-size: 0.85rem;
 }
+.date-input {
+  max-width: 11em;
+}
+.date-input.invalid {
+  border-color: var(--danger);
+  outline-color: var(--danger);
+}
+.desc-hint {
+  font-size: 0.8rem;
+  margin: 4px 0 12px;
+}
 
 .face-item {
   border-bottom: 1px solid var(--border);
@@ -417,6 +500,15 @@ input[type="text"] {
 .face-item .save { background: var(--muted); }
 .face-item.named .save { background: var(--accent-2); }
 
+.face-item .use-recog {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+}
 .face-item .suggestion {
   margin-top: 8px;
   padding: 6px 8px;
