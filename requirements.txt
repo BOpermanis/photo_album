@@ -19,3 +19,4 @@ transformers<5
 torch==2.14.0+cpu
 sentencepiece
 scikit-image
+scipy

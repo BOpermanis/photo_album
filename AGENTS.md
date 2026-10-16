@@ -13,7 +13,8 @@ WSL port forwarding, and the phone workflow.
 - On WSL, the phone can't reach the WSL NAT IP: run [scripts/wsl-forward.ps1](scripts/wsl-forward.ps1)
   once in an **Administrator PowerShell on Windows** to forward port 8000 (re-run after a
   reboot, since the WSL IP changes). See [README.md](README.md) for details.
-- First run downloads the InsightFace detection model automatically.
+- First run downloads the InsightFace detection model automatically; the first `age`
+  job downloads the Hugging Face age classifier (`nateraw/vit-age-classifier`, ~350 MB).
 - There is **no test suite** and no linter config — verify changes by running the app.
 
 ## Architecture
@@ -24,18 +25,25 @@ Backend package `backend/`, launched by [run.py](run.py):
   (`_face_dict`, `_photo_detail`). The SPA is mounted at `/` **last**, so declare new
   `/api/...` routes above that mount.
 - [backend/worker.py](backend/worker.py) — multiprocessing pool + job handlers
-  (`detect`, `align`, `rerun_detect`).
+  (`detect`, `align`, `rerun_detect`, `age`). General workers load the detector and skip
+  `age`; a dedicated age lane loads only the torch age model, and an align-only lane
+  serves interactive crops.
 - [backend/jobs.py](backend/jobs.py) — persistent SQLite job queue; atomic claim,
   ordered by `priority DESC, id DESC`.
 - [backend/db.py](backend/db.py) — engine, WAL pragmas, and additive migrations.
 - [backend/models.py](backend/models.py) — SQLModel tables (`Album`, `Person`,
-  `Photo`, `Face`, `Job`, `FaceIndexEntry`, `PersonPhotoOrder`).
-- [backend/timeline.py](backend/timeline.py) — chronological order of each person's
-  photos, stored in `PersonPhotoOrder`; undated photos get a year estimated by harmonic
-  label propagation over face embeddings, while `Photo.pinned_year` (set by dragging a
-  card on the person page) acts as a fixed anchor like a real date. Call
-  `timeline.reorder_persons()` after any change to a person's tagged photos, a photo's
-  `date`, or its `pinned_year`.
+  `Photo`, `Face`, `Job`, `FaceIndexEntry`, `PersonPhotoOrder`, `TimelineState`).
+- [backend/timeline.py](backend/timeline.py) — dates undated photos with ONE global
+  robust least-squares solve: fixed facts (`Photo.date`, `Photo.pinned_year` from
+  dragging on a person page, `Person.birth_year`/`death_year` as hard bounds) plus soft
+  measurements (per-person face-similarity propagation, apparent age = photo year − birth
+  year, with unknown birth years solved too). Writes `Photo.estimated_year`,
+  `Person.estimated_birth_year` and `PersonPhotoOrder`. After changing any input in the
+  API process call `timeline.refresh(session)`; worker processes only call
+  `timeline.mark_dirty(session)` and the API re-solves lazily (`ensure_fresh`). Sigmas
+  were tuned by cross-validation on dated photos — re-check before changing them.
+- [backend/age.py](backend/age.py) — apparent age + sd per face (ViT FairFace classifier).
+  InsightFace's `genderage` was evaluated and is unusable on old scans/children.
 - [backend/detect.py](backend/detect.py) — InsightFace detector, per-process singleton.
 - [backend/recognize.py](backend/recognize.py) — in-memory Annoy index of user-confirmed
   reference faces.

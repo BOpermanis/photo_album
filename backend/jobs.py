@@ -12,7 +12,7 @@ from sqlmodel import Session, select
 
 from .models import Job
 
-PRIORITY = {"detect": 0, "align": 10, "rerun_detect": 10}
+PRIORITY = {"detect": 0, "align": 10, "rerun_detect": 10, "age": -1}
 ACTIVE = ("pending", "running")
 
 

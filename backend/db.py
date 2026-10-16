@@ -82,6 +82,17 @@ def _run_migrations() -> None:
             backfill_photo_dates(conn)
         if "pinned_year" not in photo_cols:
             conn.execute(text("ALTER TABLE photo ADD COLUMN pinned_year FLOAT"))
+        if "estimated_year" not in photo_cols:
+            conn.execute(text("ALTER TABLE photo ADD COLUMN estimated_year FLOAT"))
+
+        person_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(person)"))}
+        for col, typ in (
+            ("birth_year", "INTEGER"),
+            ("death_year", "INTEGER"),
+            ("estimated_birth_year", "FLOAT"),
+        ):
+            if col not in person_cols:
+                conn.execute(text(f"ALTER TABLE person ADD COLUMN {col} {typ}"))
 
         face_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(face)"))}
         if "poly_original" not in face_cols:
@@ -94,6 +105,28 @@ def _run_migrations() -> None:
             conn.execute(
                 text("ALTER TABLE face ADD COLUMN use_for_recognition BOOLEAN DEFAULT 1")
             )
+        if "age" not in face_cols:
+            conn.execute(text("ALTER TABLE face ADD COLUMN age FLOAT"))
+            conn.execute(text("ALTER TABLE face ADD COLUMN age_sd FLOAT"))
+            # One-time: estimate apparent ages of all existing faces in the
+            # background (lowest priority, after any pending detection).
+            now = time.time()
+            conn.execute(
+                text(
+                    "INSERT INTO job (photo_id, kind, status, priority, payload, "
+                    "error, created_at, updated_at) "
+                    "SELECT DISTINCT photo_id, 'age', 'pending', -1, '', '', :now, :now "
+                    "FROM face"
+                ),
+                {"now": now},
+            )
+
+        conn.execute(
+            text(
+                "INSERT OR IGNORE INTO timelinestate (id, change_version, computed_version) "
+                "VALUES (1, 0, -1)"
+            )
+        )
 
         rel_cols = {
             row[1] for row in conn.execute(text("PRAGMA table_info(personrelation)"))
@@ -105,6 +138,7 @@ def _run_migrations() -> None:
                     "DEFAULT 0"
                 )
             )
+        _upgrade_custom_relations(conn)
 
         # Ensure at least one album exists and every photo belongs to one.
         default_album_id = conn.execute(
@@ -129,6 +163,44 @@ def _run_migrations() -> None:
         if version < SCHEMA_VERSION:
             _wipe_and_requeue(conn)
             conn.execute(text(f"PRAGMA user_version = {SCHEMA_VERSION}"))
+
+
+def _upgrade_custom_relations(conn) -> None:
+    """Convert "custom" relations whose label names a preset (e.g. "cousin",
+    "collegue", "kolēģis") into that preset. Idempotent; a row that would
+    duplicate an existing preset relation is dropped instead."""
+    from . import person_parse
+
+    rows = list(
+        conn.execute(
+            text(
+                "SELECT id, person_id, related_person_id, related_name_raw, "
+                "custom_label FROM personrelation WHERE kind = 'custom'"
+            )
+        )
+    )
+    for rid, pid, related_id, raw, label in rows:
+        preset = person_parse.preset_for_label(label)
+        if not preset:
+            continue
+        dup = conn.execute(
+            text(
+                "SELECT 1 FROM personrelation WHERE id != :id AND person_id = :p "
+                "AND kind = :k AND related_person_id IS :r AND COALESCE(is_auto, 0) = 0 "
+                "AND COALESCE(related_name_raw, '') = COALESCE(:raw, '')"
+            ),
+            {"id": rid, "p": pid, "k": preset, "r": related_id, "raw": raw},
+        ).first()
+        if dup:
+            conn.execute(text("DELETE FROM personrelation WHERE id = :id"), {"id": rid})
+        else:
+            conn.execute(
+                text(
+                    "UPDATE personrelation SET kind = :k, custom_label = '' "
+                    "WHERE id = :id"
+                ),
+                {"k": preset, "id": rid},
+            )
 
 
 def _wipe_and_requeue(conn) -> None:

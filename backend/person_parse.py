@@ -17,13 +17,29 @@ RELATION_WORDS = {
     "meita": "daughter", "dēls": "son",
     "vecmāte": "grandmother", "vectēvs": "grandfather",
     "draugs": "friend", "draudzene": "friend",
+    "brālēns": "cousin", "māsīca": "cousin",
+    "kolēģis": "colleague", "kolēģe": "colleague",
 }
 
 # Built-in relation types offered in the UI (plus the "custom" sentinel).
 RELATION_PRESETS = [
     "son", "daughter", "father", "mother", "husband", "wife",
-    "brother", "sister", "grandfather", "grandmother", "friend",
+    "brother", "sister", "grandfather", "grandmother", "cousin",
+    "friend", "colleague",
 ]
+
+
+def preset_for_label(label: str):
+    """Map a free-text custom relation label to a preset key, or None.
+
+    Accepts preset names, common misspellings and the Latvian relation words,
+    so legacy "custom" rows can be upgraded to their preset."""
+    low = (label or "").strip().casefold()
+    if low in RELATION_PRESETS:
+        return low
+    if low in ("collegue", "colegue", "coleague"):
+        return "colleague"
+    return RELATION_WORDS.get(low)
 
 PROFESSION_STEMS = ["skolotāj", "direktor", "audzinātāj", "pārzin", "pavār", "sanitār"]
 

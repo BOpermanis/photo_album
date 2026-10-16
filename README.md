@@ -5,6 +5,9 @@ Wi-Fi from the phone's browser, and tag detected faces with names in a local web
 
 - **Backend:** Python + FastAPI, SQLite for tags, originals kept full-res on disk.
 - **Face detection:** InsightFace / RetinaFace (ONNX, CPU) — draws boxes; you type names.
+- **Photo dating:** undated photos get an estimated year from face similarity and
+  apparent ages (a ViT age classifier), bounded by the birth/death years you enter on a
+  person; drag a photo on a person's page to correct it.
 - **Frontend:** vanilla HTML/JS served by FastAPI (no build step).
 
 ## Setup
@@ -15,7 +18,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The first run downloads the InsightFace detection model automatically.
+The first run downloads the InsightFace detection model automatically. Apparent ages are
+computed by a background job that downloads a ~350 MB age model from Hugging Face the
+first time; after upgrading, every existing face is queued once for age estimation
+(a few minutes per thousand faces on CPU).
 
 ## Run
 

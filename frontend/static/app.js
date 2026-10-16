@@ -107,9 +107,10 @@ const routes = [
 
 function router() {
   const hash = location.hash.replace(/^#/, "") || "/albums";
+  const path = hash.split("?")[0];
   updateAlbumChip();
   for (const [re, handler] of routes) {
-    const m = hash.match(re);
+    const m = path.match(re);
     if (m) {
       handler(...m.slice(1));
       return;
@@ -261,9 +262,26 @@ async function viewPhotos() {
 // --------------------------- Photo detail ---------------------------
 const SVGNS = "http://www.w3.org/2000/svg";
 
+// Where the photo was opened from: `#/photo/:id?person=N` browses that person's
+// photos (timeline order); otherwise the active album grid.
+function photoContext() {
+  const params = new URLSearchParams(location.hash.split("?")[1] || "");
+  const personId = Number(params.get("person")) || null;
+  return personId
+    ? {
+        personId,
+        query: `?person=${personId}`,
+        backHash: `#/person/${personId}`,
+        backLabel: "← Back to person",
+      }
+    : { personId: null, query: "", backHash: "#/photos", backLabel: "← Back to photos" };
+}
+
 async function setupNav(view, photo, id) {
   const prevBtn = view.querySelector(".nav-prev");
   const nextBtn = view.querySelector(".nav-next");
+  const ctx = photoContext();
+  const go = (pid) => (location.hash = `#/photo/${pid}${ctx.query}`);
   let prevId = null;
   let nextId = null;
 
@@ -279,19 +297,23 @@ async function setupNav(view, photo, id) {
     if (document.querySelector(".editor-overlay")) return; // a modal owns the keys
     if (e.key === "ArrowLeft" && prevId != null) {
       e.preventDefault();
-      location.hash = `#/photo/${prevId}`;
+      go(prevId);
     } else if (e.key === "ArrowRight" && nextId != null) {
       e.preventDefault();
-      location.hash = `#/photo/${nextId}`;
+      go(nextId);
     } else if (e.key === "Escape") {
       e.preventDefault();
-      location.hash = "#/photos";
+      location.hash = ctx.backHash;
     }
   }
   window.addEventListener("keydown", onKey);
 
   try {
-    const { photos } = await getJSON(`/api/photos?filter=all&album_id=${photo.album_id}`);
+    const { photos } = await getJSON(
+      ctx.personId
+        ? `/api/persons/${ctx.personId}/photos`
+        : `/api/photos?filter=all&album_id=${photo.album_id}`
+    );
     if (!view.isConnected) return;
     const ids = photos.map((p) => p.id);
     const i = ids.indexOf(Number(id));
@@ -300,11 +322,11 @@ async function setupNav(view, photo, id) {
     nextId = i < ids.length - 1 ? ids[i + 1] : null;
     if (prevId != null) {
       prevBtn.disabled = false;
-      prevBtn.addEventListener("click", () => (location.hash = `#/photo/${prevId}`));
+      prevBtn.addEventListener("click", () => go(prevId));
     }
     if (nextId != null) {
       nextBtn.disabled = false;
-      nextBtn.addEventListener("click", () => (location.hash = `#/photo/${nextId}`));
+      nextBtn.addEventListener("click", () => go(nextId));
     }
   } catch {
     /* leave Prev/Next disabled */
@@ -312,10 +334,11 @@ async function setupNav(view, photo, id) {
 }
 
 async function viewPhotoDetail(id) {
+  const navCtx = photoContext();
   const view = el(`
     <div>
       <div class="toolbar detail-nav">
-        <a class="back" href="#/photos">← Back to photos</a>
+        <a class="back" href="${navCtx.backHash}">${navCtx.backLabel}</a>
         <span class="toolbar-spacer"></span>
         <button class="chip nav-prev" disabled>← Prev</button>
         <button class="chip nav-next" disabled>Next →</button>
@@ -347,7 +370,7 @@ async function viewPhotoDetail(id) {
     return;
   }
 
-  // Prev/Next navigate within the photo's album, in the same order as the grid.
+  // Prev/Next navigate within the context grid (album or person), in its order.
   setupNav(view, photo, id);
 
   // Which image space we're viewing: "aligned" (perspective-corrected) or
@@ -378,12 +401,18 @@ async function viewPhotoDetail(id) {
   stage.appendChild(labels);
 
   // Date + description editor (persists across face reloads).
+  const guess =
+    photo.pinned_year != null
+      ? `≈ ${Math.floor(photo.pinned_year)} — placed manually on a person timeline`
+      : photo.estimated_year != null
+        ? `≈ ${Math.floor(photo.estimated_year)} — estimated from faces and ages`
+        : "";
   const descBox = el(`
     <div class="desc-box">
       <label class="desc-label" for="photoDate">Date</label>
       <input id="photoDate" class="desc-input date-input" type="text" maxlength="10"
         autocomplete="off" placeholder="YYYY/MM/DD" value="${esc(photo.date || "")}"/>
-      <div class="desc-hint muted">YYYY, YYYY/MM or YYYY/MM/DD</div>
+      <div class="desc-hint muted">YYYY, YYYY/MM or YYYY/MM/DD${guess ? ` · undated: ${esc(guess)}` : ""}</div>
       <label class="desc-label">Description</label>
       <textarea class="desc-input" rows="3" placeholder="Add a note about this photo…">${esc(photo.description || "")}</textarea>
       <div class="desc-actions">
@@ -670,7 +699,7 @@ async function viewPhotoDetail(id) {
     try {
       await del(`/api/photos/${id}`);
       closeStream();
-      location.hash = "#/photos";
+      location.hash = navCtx.backHash;
     } catch (e) {
       alert(e.message);
     }
@@ -1471,6 +1500,17 @@ async function viewPerson(id) {
         <input id="givenName" type="text" value="${esc(detail.given_name)}" /></label>`)
     );
 
+    const estBirth =
+      detail.estimated_birth_year != null ? `≈ ${Math.floor(detail.estimated_birth_year)}` : "";
+    form.appendChild(
+      el(`<div class="field"><span>Life span <span class="muted">(bounds the dating of their photos${estBirth ? `; birth estimated from photos ${estBirth}` : ""})</span></span>
+        <div class="erow">
+          <input id="birthYear" class="sy" type="number" placeholder="${esc(estBirth || "born")}" title="Birth year" value="${detail.birth_year ?? ""}" />
+          <span class="relword">–</span>
+          <input id="deathYear" class="ey" type="number" placeholder="died" title="Death year" value="${detail.death_year ?? ""}" />
+        </div></div>`)
+    );
+
     const namesSec = section("Surnames & nicknames", "name");
     for (const n of detail.names) namesSec.list.appendChild(nameRow(n));
     namesSec.add.addEventListener("click", () =>
@@ -1532,6 +1572,8 @@ async function viewPerson(id) {
     const body = {
       given_name: view.querySelector("#givenName").value,
       notes: view.querySelector("#notes").value,
+      birth_year: intOrNull(view.querySelector("#birthYear").value),
+      death_year: intOrNull(view.querySelector("#deathYear").value),
       names: [...editorWrap.querySelectorAll(".name-row")]
         .map((r) => ({
           value: r.querySelector(".v").value,
@@ -1573,6 +1615,9 @@ async function viewPerson(id) {
       setName();
       renderEditor();
       view.querySelector("#saveStatus").textContent = "Saved ✓";
+      // Life-span changes re-date photos, so refresh the timeline too.
+      photoData = await getJSON(`/api/persons/${id}/photos`);
+      renderPhotos();
     } catch (e) {
       status.textContent = "Error: " + e.message;
     }
@@ -1591,14 +1636,17 @@ async function viewPerson(id) {
       else if (p.pinned_year != null)
         label = `<span class="date-label pinned" title="Placed manually">📌 ≈ ${Math.floor(p.pinned_year)}<button class="unpin" type="button" title="Remove manual placement">×</button></span>`;
       else if (p.estimated_year != null)
-        label = `<span class="date-label estimated" title="Estimated from face similarity to dated photos">≈ ${Math.floor(p.estimated_year)}</span>`;
+        label = `<span class="date-label estimated" title="Estimated from face similarity and apparent ages of everyone in the photo">≈ ${Math.floor(p.estimated_year)}</span>`;
       // Dated photos follow their date; only undated ones can be dragged.
       const draggable = !p.date;
       anyDraggable = anyDraggable || draggable;
       const card = el(
         `<div class="card" data-id="${p.id}" ${draggable ? "data-draggable" : ""}>${label}<img loading="lazy" draggable="false" src="/media/${esc(p.display_filename || p.filename)}?size=200" alt=""/></div>`
       );
-      card.addEventListener("click", () => (location.hash = `#/photo/${p.id}`));
+      card.addEventListener(
+        "click",
+        () => (location.hash = `#/photo/${p.id}?person=${id}`)
+      );
       const unpin = card.querySelector(".unpin");
       if (unpin)
         unpin.addEventListener("click", async (e) => {
@@ -1626,7 +1674,7 @@ async function viewPerson(id) {
       renderPhotos();
     });
     const hint = anyDraggable
-      ? el(`<div class="muted timeline-hint">Oldest first. ≈ years are estimated from faces — drag an undated photo to fix its place (long-press on touch).</div>`)
+      ? el(`<div class="muted timeline-hint">Oldest first. ≈ years are estimated from faces, apparent ages and birth/death years — drag an undated photo to fix its place (long-press on touch).</div>`)
       : el(`<div class="muted timeline-hint">Oldest first.</div>`);
     wrap.replaceChildren(hint, grid);
   }

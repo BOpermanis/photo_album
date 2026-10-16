@@ -18,7 +18,7 @@ from sqlmodel import Session, func, select
 
 from . import export, jobs, person_parse, recognize, relations, timeline, warp, worker
 from .config import FRONTEND_DIR, LIBRARY_DIR, PORT, THUMB_DIR, THUMBNAIL_MAX_SIZE
-from .date_parse import normalize_date
+from .date_parse import MAX_YEAR, MIN_YEAR, normalize_date
 from .db import engine, get_session, init_db
 from .models import (
     Album,
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     with Session(engine) as session:
         # Refresh stored person timelines in case dates/tags changed offline
         # (migrations, scripts).
-        timeline.reorder_all(session)
+        timeline.refresh(session)
         requeued = jobs.requeue_stale(session)
         if requeued:
             print(f"[jobs] requeued {requeued} stale job(s)")
@@ -272,6 +272,7 @@ def list_photos(
 
 @app.get("/api/photos/{photo_id}")
 def get_photo(photo_id: int, session: Session = Depends(get_session)):
+    timeline.ensure_fresh(session)  # e.g. ages computed by workers since
     photo = session.get(Photo, photo_id)
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
@@ -296,6 +297,8 @@ def _photo_detail(session: Session, photo: Photo) -> dict:
         "processed": photo.processed,
         "description": photo.description,
         "date": photo.date,
+        "estimated_year": None if photo.date else photo.estimated_year,
+        "pinned_year": None if photo.date else photo.pinned_year,
         "has_edit": bool(photo.edited_filename),
         "detect_pending": flags["detect_pending"],
         "align_pending": flags["align_pending"],
@@ -389,7 +392,7 @@ def update_description(
     session.add(photo)
     session.commit()
     if date_changed:
-        timeline.reorder_persons(session, timeline.persons_in_photos(session, [photo.id]))
+        timeline.refresh(session)
     return {"id": photo.id, "description": photo.description, "date": photo.date}
 
 
@@ -422,7 +425,8 @@ def delete_photo(photo_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Photo not found")
     ref_ids, files, person_ids = _purge_photo(session, photo)
     session.commit()
-    timeline.reorder_persons(session, person_ids)
+    if person_ids:
+        timeline.refresh(session)
     for face_id in ref_ids:
         recognize.remove(face_id)
     for name in files:
@@ -564,7 +568,7 @@ def assign_face(
     session.add(face)
     session.commit()
     _index_reference_face(session, face, person.id)
-    timeline.reorder_persons(session, {old_person_id, person.id})
+    timeline.refresh(session)
     return _face_dict(session, face)
 
 
@@ -611,7 +615,8 @@ def unassign_face(face_id: int, session: Session = Depends(get_session)):
     session.add(face)
     session.commit()
     recognize.remove(face_id)
-    timeline.reorder_persons(session, [old_person_id])
+    if old_person_id is not None:
+        timeline.refresh(session)
     return _face_dict(session, face)
 
 
@@ -624,7 +629,8 @@ def delete_face(face_id: int, session: Session = Depends(get_session)):
     session.delete(face)
     session.commit()
     recognize.remove(face_id)
-    timeline.reorder_persons(session, [old_person_id])
+    if old_person_id is not None:
+        timeline.refresh(session)
     return {"status": "deleted", "id": face_id}
 
 
@@ -684,6 +690,7 @@ def add_manual_face(
     session.add(face)
     session.commit()
     session.refresh(face)
+    jobs.enqueue(session, photo_id, "age")
     return _face_dict(session, face)
 
 
@@ -716,6 +723,8 @@ class RelationItem(BaseModel):
 class PersonUpdate(BaseModel):
     given_name: str = ""
     notes: str = ""
+    birth_year: Optional[int] = None
+    death_year: Optional[int] = None
     names: List[NameItem] = []
     professions: List[ProfessionItem] = []
     relations: List[RelationItem] = []
@@ -794,6 +803,9 @@ def _person_detail(session: Session, person: Person) -> dict:
         "given_name": person.given_name,
         "raw_name": person.raw_name,
         "notes": person.notes,
+        "birth_year": person.birth_year,
+        "death_year": person.death_year,
+        "estimated_birth_year": person.estimated_birth_year,
         "photo_count": photo_count,
         "names": [
             {"id": n.id, "value": n.value, "kind": n.kind} for n in names
@@ -840,6 +852,7 @@ def create_person(body: PersonBody, session: Session = Depends(get_session)):
 
 @app.get("/api/persons/{person_id}")
 def get_person(person_id: int, session: Session = Depends(get_session)):
+    timeline.ensure_fresh(session)  # estimated_birth_year
     person = session.get(Person, person_id)
     if not person:
         raise HTTPException(status_code=404, detail="Person not found")
@@ -855,9 +868,26 @@ def update_person(
     person = session.get(Person, person_id)
     if not person:
         raise HTTPException(status_code=404, detail="Person not found")
+    for y in (body.birth_year, body.death_year):
+        if y is not None and not MIN_YEAR <= y <= MAX_YEAR:
+            raise HTTPException(
+                status_code=400, detail=f"Years must be between {MIN_YEAR} and {MAX_YEAR}"
+            )
+    if (
+        body.birth_year is not None
+        and body.death_year is not None
+        and body.death_year < body.birth_year
+    ):
+        raise HTTPException(status_code=400, detail="Death year is before birth year")
+    lifespan_changed = (person.birth_year, person.death_year) != (
+        body.birth_year,
+        body.death_year,
+    )
 
     person.given_name = body.given_name.strip()
     person.notes = body.notes
+    person.birth_year = body.birth_year
+    person.death_year = body.death_year
     session.add(person)
 
     for row in session.exec(
@@ -900,6 +930,11 @@ def update_person(
         )
     for r in body.relations:
         kind = r.kind if r.kind in person_parse.RELATION_PRESETS else "custom"
+        custom_label = r.custom_label.strip()
+        if kind == "custom":
+            preset = person_parse.preset_for_label(custom_label)
+            if preset:
+                kind, custom_label = preset, ""
         target_id = r.related_person_id
         if target_id is not None and not session.get(Person, target_id):
             target_id = None
@@ -909,7 +944,7 @@ def update_person(
                 related_person_id=target_id,
                 related_name_raw=r.related_name_raw.strip(),
                 kind=kind,
-                custom_label=r.custom_label.strip(),
+                custom_label=custom_label,
                 note=r.note.strip(),
             )
         )
@@ -917,6 +952,8 @@ def update_person(
 
     _recompute_display(session, person)
     session.commit()
+    if lifespan_changed:
+        timeline.refresh(session)
     session.refresh(person)
     return _person_detail(session, person)
 
@@ -927,7 +964,7 @@ def person_photos(person_id: int, session: Session = Depends(get_session)):
     if not person:
         raise HTTPException(status_code=404, detail="Person not found")
     # Precomputed chronological order (see timeline.py): oldest first, undated
-    # photos slotted in at a year estimated from face similarity.
+    # photos slotted in at the year the timeline solver estimated for them.
     summaries = []
     for row in timeline.ordered_photos(session, person_id):
         photo = session.get(Photo, row.photo_id)
@@ -985,7 +1022,7 @@ def move_person_photo(
     photo.pinned_year = year
     session.add(photo)
     session.commit()
-    timeline.reorder_persons(session, timeline.persons_in_photos(session, [photo_id]))
+    timeline.refresh(session)
     return person_photos(person_id, session)
 
 
@@ -998,7 +1035,7 @@ def unpin_photo(photo_id: int, session: Session = Depends(get_session)):
     photo.pinned_year = None
     session.add(photo)
     session.commit()
-    timeline.reorder_persons(session, timeline.persons_in_photos(session, [photo_id]))
+    timeline.refresh(session)
     return {"id": photo.id, "pinned_year": None}
 
 
@@ -1251,7 +1288,8 @@ def delete_album(album_id: int, session: Session = Depends(get_session)):
         person_ids |= photo_persons
     session.delete(album)
     session.commit()
-    timeline.reorder_persons(session, person_ids)
+    if person_ids:
+        timeline.refresh(session)
     for face_id in ref_ids:
         recognize.remove(face_id)
     for name in files:

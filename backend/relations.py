@@ -7,9 +7,11 @@ A's son).
 
 A relation is stored as the directed triple ``(person, related, kind)`` meaning
 "person is <kind> of related", matching the model's semantics. Inference works
-on gender-neutral facts (parent / sibling / spouse / grandparent) and only emits
-a preset relation when the subject's gender is known (inferred from the gendered
-relation words the person already participates in).
+on gender-neutral facts (parent / sibling / spouse / grandparent / cousin) and
+only emits a gendered preset relation when the subject's gender is known
+(inferred from the gendered relation words the person already participates
+in); "cousin" is gender-neutral and always emitted. Non-kin relations (friend,
+colleague) are never propagated.
 """
 from typing import Iterable, Set, Tuple
 
@@ -23,6 +25,7 @@ CHILD_KINDS = {"son", "daughter"}
 SIBLING_KINDS = {"brother", "sister"}
 SPOUSE_KINDS = {"husband", "wife"}
 GRAND_KINDS = {"grandfather", "grandmother"}
+COUSIN_KINDS = {"cousin"}
 
 
 def deduce(relations: Iterable[Triple]) -> Set[Triple]:
@@ -34,6 +37,7 @@ def deduce(relations: Iterable[Triple]) -> Set[Triple]:
     siblings: Set[Tuple[int, int]] = set()  # symmetric
     spouses: Set[Tuple[int, int]] = set()  # symmetric
     grands: Set[Tuple[int, int]] = set()  # (g, c): g is a grandparent of c
+    cousins: Set[Tuple[int, int]] = set()  # symmetric
 
     def note_gender(person: int, kind: str) -> None:
         if kind in MALE_KINDS:
@@ -55,8 +59,10 @@ def deduce(relations: Iterable[Triple]) -> Set[Triple]:
             spouses.add((a, b))
         elif kind in GRAND_KINDS:
             grands.add((a, b))
+        elif kind in COUSIN_KINDS:
+            cousins.add((a, b))
 
-    _close(parents, siblings, spouses, grands)
+    _close(parents, siblings, spouses, grands, cousins)
 
     out: Set[Triple] = set()
     gmap = {
@@ -81,11 +87,14 @@ def deduce(relations: Iterable[Triple]) -> Set[Triple]:
         emit(x, y, "spouse")
     for g, c in grands:
         emit(g, c, "grand")
+    # "cousin" is gender-neutral, so it never depends on a known gender.
+    for x, y in cousins:
+        out.add((x, y, "cousin"))
 
     return out
 
 
-def _close(parents, siblings, spouses, grands) -> None:
+def _close(parents, siblings, spouses, grands, cousins) -> None:
     """Expand the fact sets in place until no rule fires."""
     changed = True
     while changed:
@@ -131,3 +140,26 @@ def _close(parents, siblings, spouses, grands) -> None:
                 if b == b2 and a != c and (a, c) not in grands:
                     grands.add((a, c))
                     changed = True
+
+        # Cousins are symmetric (but not transitive: a cousin's cousin may be
+        # from the other side of the family).
+        for x, y in list(cousins):
+            if (y, x) not in cousins:
+                cousins.add((y, x))
+                changed = True
+
+        # A cousin of one sibling is a cousin of all of them.
+        for x, y in list(cousins):
+            for y2, z in list(siblings):
+                if y == y2 and x != z and (x, z) not in cousins \
+                        and (x, z) not in siblings:
+                    cousins.add((x, z))
+                    changed = True
+
+        # Children of siblings are cousins.
+        for p1, p2 in list(siblings):
+            for a in children.get(p1, ()):
+                for b in children.get(p2, ()):
+                    if a != b and (a, b) not in siblings and (a, b) not in cousins:
+                        cousins.add((a, b))
+                        changed = True

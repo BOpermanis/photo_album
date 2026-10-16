@@ -26,6 +26,12 @@ class Person(SQLModel, table=True):
     # The original free-text name this person was migrated from (provenance).
     raw_name: str = Field(default="")
     notes: str = Field(default="")
+    # Life span as entered by the user (years). Hard bounds for photo dating.
+    birth_year: Optional[int] = Field(default=None)
+    death_year: Optional[int] = Field(default=None)
+    # Birth year inferred by the timeline solver from apparent ages (None when
+    # birth_year is set or there is too little evidence). Read-only hint.
+    estimated_birth_year: Optional[float] = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -60,7 +66,8 @@ class PersonRelation(SQLModel, table=True):
     )
     related_name_raw: str = Field(default="")
     # A preset key (son, daughter, father, mother, husband, wife, brother,
-    # sister, grandfather, grandmother, friend) or the sentinel "custom".
+    # sister, grandfather, grandmother, cousin, friend, colleague) or the
+    # sentinel "custom".
     kind: str = Field(default="custom")
     custom_label: str = Field(default="")
     note: str = Field(default="")
@@ -95,6 +102,9 @@ class Photo(SQLModel, table=True):
     # a known date for ordering everyone in the photo (see timeline.py).
     # Cleared when a real `date` is entered.
     pinned_year: Optional[float] = Field(default=None)
+    # Year inferred by the timeline solver for an undated, unpinned photo
+    # (one value per photo, shared by everyone in it; None = dated/unknown).
+    estimated_year: Optional[float] = Field(default=None)
     # Perspective-corrected copy of the original (empty = none). The original
     # upload is always kept; faces and display use the edited copy when present.
     edited_filename: str = Field(default="")
@@ -125,17 +135,29 @@ class Face(SQLModel, table=True):
     person_id: Optional[int] = Field(default=None, foreign_key="person.id", index=True)
     # False keeps a (poor-quality) face tagged but out of the recognition index.
     use_for_recognition: bool = Field(default=True)
+    # Apparent age in years and its standard deviation (see age.py); None until
+    # the background `age` job has run for this face.
+    age: Optional[float] = Field(default=None)
+    age_sd: Optional[float] = Field(default=None)
 
 
 class PersonPhotoOrder(SQLModel, table=True):
-    # Chronological position of a photo on a person's page, recomputed by
-    # timeline.reorder_persons() whenever the person's photo set or a date changes.
+    # Chronological position of a photo on a person's page, rewritten by the
+    # timeline solver (timeline.py) whenever its inputs change.
     person_id: int = Field(foreign_key="person.id", primary_key=True)
     photo_id: int = Field(foreign_key="photo.id", primary_key=True, index=True)
     position: int = 0
-    # Year inferred from face similarity for an undated photo (None when the
-    # photo has a date or could not be estimated).
+    # Copy of Photo.estimated_year at solve time.
     estimated_year: Optional[float] = Field(default=None)
+
+
+class TimelineState(SQLModel, table=True):
+    # Single row (id=1). Any change to timeline inputs bumps change_version
+    # (also from worker processes); the API process re-solves when it is ahead
+    # of computed_version.
+    id: int = Field(default=1, primary_key=True)
+    change_version: int = 0
+    computed_version: int = -1
 
 
 class Job(SQLModel, table=True):
